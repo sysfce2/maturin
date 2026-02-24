@@ -58,7 +58,7 @@ tar = "0.4.38"
 tempfile = "3.2.0"
 toml = "0.9.11"
 toml_edit = "0.24.0"
-zip = { version = "6.0.0", default-features = false, features = [
+zip = { version = "8.1.0", default-features = false, features = [
     "bzip2",
     "deflate",
     "time",
@@ -74,7 +74,7 @@ semver = "1.0.22"
 target-lexicon = "0.13.3"
 indexmap = "2.2.3"
 pyproject-toml = { version = "0.13.5", features = ["pep639-glob"] }
-python-pkginfo = "0.6.6"
+python-pkginfo = "0.6.8"
 textwrap = "0.16.1"
 ignore = "0.4.20"
 itertools = "0.14.0"
