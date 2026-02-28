@@ -111,7 +111,9 @@ jobs:
       - name: Archive binary (windows)
         if: matrix.os == 'windows-latest'
         run: |
-          7z a ${{ matrix.name }} target/maturin/${{ github.event.repository.name }}.exe
+          cd target/maturin
+          7z a ../../${{ matrix.name }} ${{ github.event.repository.name }}.exe
+          cd -
 
       - name: Archive binary (linux)
         if: matrix.os == 'ubuntu-latest'
