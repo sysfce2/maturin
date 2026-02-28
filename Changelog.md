@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.12.5
+
+* Feat: include debug info files (.pdb, .dSYM, .dwp) in wheels ([#3024](https://github.com/pyo3/maturin/pull/3024))
+* Fix wrong abi3 tag for conditional cargo features enabled pyo3 abi3 feature ([#3029](https://github.com/pyo3/maturin/pull/3029))
+* Fix: `maturin build --sdist` wheel name/layout for excluded workspace crates ([#3031](https://github.com/pyo3/maturin/pull/3031))
+* Fix: preserve wheel output dir when building from unpacked sdist ([#3036](https://github.com/pyo3/maturin/pull/3036))
+* Feat: add python-implementation condition to conditional features ([#3038](https://github.com/pyo3/maturin/pull/3038))
+* Update zip to 8.1 ([#3039](https://github.com/pyo3/maturin/pull/3039))
+* Use the latest version of github actions ([#3040](https://github.com/pyo3/maturin/pull/3040))
+* Use renovate and pinned hashes for GitHub Actions ([#3043](https://github.com/pyo3/maturin/pull/3043))
+* Chore(deps): update taiki-e/install-action digest to 7410117 ([#3046](https://github.com/pyo3/maturin/pull/3046))
+* Chore(deps): update dtolnay/rust-toolchain digest to efa25f7 ([#3045](https://github.com/pyo3/maturin/pull/3045))
+* Chore(deps): update actions/attest-build-provenance action to v4 ([#3047](https://github.com/pyo3/maturin/pull/3047))
+* Use mmap for faster warn_missing_py_init ([#2950](https://github.com/pyo3/maturin/pull/2950))
+
 ## 1.12.4
 
 * Upgrade memmap2 version ([#3021](https://github.com/pyo3/maturin/pull/3021))
