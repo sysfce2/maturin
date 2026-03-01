@@ -1,35 +1,25 @@
 use crate::auditwheel::{AuditWheelMode, PlatformTag};
-use crate::bridge::{Abi3Version, PyO3Crate};
+use crate::bridge::{find_bridge, is_generating_import_lib};
 use crate::compile::{CompileTarget, LIB_CRATE_TYPES};
 use crate::compression::CompressionOptions;
-use crate::cross_compile::{
-    find_build_details, find_sysconfigdata, parse_build_details_json_file, parse_sysconfigdata,
-};
 use crate::project_layout::ProjectResolver;
 use crate::pyproject_toml::{FeatureSpec, ToolMaturin};
-use crate::python_interpreter::{InterpreterConfig, InterpreterKind};
+use crate::python_interpreter::InterpreterResolver;
 use crate::target::{
     detect_arch_from_python, detect_target_from_cross_python, is_arch_supported_by_pypi,
 };
-use crate::{BridgeModel, BuildContext, PyO3, PythonInterpreter, Target};
-use anyhow::{Context, Result, bail, format_err};
-use cargo_metadata::{CrateType, PackageId, TargetKind};
-use cargo_metadata::{Metadata, Node};
+use crate::{BridgeModel, BuildContext, Target};
+use anyhow::{Result, bail};
+use cargo_metadata::CrateType;
+use cargo_metadata::Metadata;
 use cargo_options::heading;
-use pep440_rs::VersionSpecifiers;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::env;
 use std::ops::{Deref, DerefMut};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::str::FromStr;
 use tracing::{debug, instrument};
-
-// This is used for `BridgeModel::PyO3`.
-// These should be treated almost identically but must be correctly identified
-// as one or the other in logs. pyo3-ffi is ordered first because it is newer
-// and more restrictive.
-const PYO3_BINDING_CRATES: [PyO3Crate; 2] = [PyO3Crate::PyO3Ffi, PyO3Crate::PyO3];
 
 /// A Rust target triple or a virtual target triple.
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
@@ -255,348 +245,6 @@ impl DerefMut for BuildOptions {
 }
 
 impl BuildOptions {
-    /// Finds the appropriate amount for python versions for each [BridgeModel].
-    fn find_interpreters(
-        &self,
-        bridge: &BridgeModel,
-        interpreter: &[PathBuf],
-        target: &Target,
-        requires_python: Option<&VersionSpecifiers>,
-        generate_import_lib: bool,
-    ) -> Result<Vec<PythonInterpreter>> {
-        match bridge {
-            BridgeModel::PyO3(PyO3 { abi3, .. }) | BridgeModel::Bin(Some(PyO3 { abi3, .. })) => {
-                match abi3 {
-                    None | Some(Abi3Version::CurrentPython) => {
-                        let mut interpreters = Vec::new();
-                        if let Some(config_file) = env::var_os("PYO3_CONFIG_FILE") {
-                            let interpreter_config =
-                                InterpreterConfig::from_pyo3_config(config_file.as_ref(), target)
-                                    .context("Invalid PYO3_CONFIG_FILE")?;
-                            interpreters.push(PythonInterpreter::from_config(interpreter_config));
-                        } else if target.cross_compiling() {
-                            if let Some(cross_lib_dir) = env::var_os("PYO3_CROSS_LIB_DIR") {
-                                let cross_lib_path: &Path = cross_lib_dir.as_ref();
-                                if let Some(build_details_path) = find_build_details(cross_lib_path)
-                                {
-                                    eprintln!(
-                                        "🐍 Using build-details.json for cross-compiling preparation"
-                                    );
-                                    let config =
-                                        parse_build_details_json_file(&build_details_path)?;
-                                    let host_interpreters = find_interpreter_in_host(
-                                        bridge,
-                                        interpreter,
-                                        target,
-                                        requires_python,
-                                    )?;
-                                    let host_python = &host_interpreters[0];
-                                    // pyo3
-                                    unsafe {
-                                        env::set_var("PYO3_PYTHON", &host_python.executable);
-                                        env::set_var(
-                                            "PYTHON_SYS_EXECUTABLE",
-                                            &host_python.executable,
-                                        )
-                                    };
-                                    let soabi = soabi_from_ext_suffix(&config.ext_suffix);
-                                    let implementation_name =
-                                        config.interpreter_kind.to_string().to_ascii_lowercase();
-                                    interpreters.push(PythonInterpreter {
-                                        config,
-                                        executable: PathBuf::new(),
-                                        platform: None,
-                                        runnable: false,
-                                        implementation_name,
-                                        soabi,
-                                    });
-                                } else {
-                                    let host_interpreters = find_interpreter_in_host(
-                                        bridge,
-                                        interpreter,
-                                        target,
-                                        requires_python,
-                                    )?;
-                                    let host_python = &host_interpreters[0];
-                                    eprintln!(
-                                        "🐍 Using host {host_python} for cross-compiling preparation"
-                                    );
-                                    // pyo3
-                                    unsafe {
-                                        env::set_var("PYO3_PYTHON", &host_python.executable);
-                                        env::set_var(
-                                            "PYTHON_SYS_EXECUTABLE",
-                                            &host_python.executable,
-                                        )
-                                    };
-
-                                    let sysconfig_path =
-                                        find_sysconfigdata(cross_lib_path, target)?;
-                                    let sysconfig_data =
-                                        parse_sysconfigdata(host_python, sysconfig_path)?;
-                                    let major = sysconfig_data
-                                        .get("version_major")
-                                        .context("version_major is not defined")?
-                                        .parse::<usize>()
-                                        .context("Could not parse value of version_major")?;
-                                    let minor = sysconfig_data
-                                        .get("version_minor")
-                                        .context("version_minor is not defined")?
-                                        .parse::<usize>()
-                                        .context("Could not parse value of version_minor")?;
-                                    let abiflags = sysconfig_data
-                                        .get("ABIFLAGS")
-                                        .map(ToString::to_string)
-                                        .unwrap_or_default();
-                                    let gil_disabled = sysconfig_data
-                                        .get("Py_GIL_DISABLED")
-                                        .map(|x| x == "1")
-                                        .unwrap_or_default();
-                                    let ext_suffix = sysconfig_data
-                                        .get("EXT_SUFFIX")
-                                        .context("syconfig didn't define an `EXT_SUFFIX` ಠ_ಠ")?;
-                                    let soabi = sysconfig_data.get("SOABI");
-                                    let interpreter_kind = soabi
-                                        .and_then(|tag| {
-                                            if tag.starts_with("pypy") {
-                                                Some(InterpreterKind::PyPy)
-                                            } else if tag.starts_with("cpython") {
-                                                Some(InterpreterKind::CPython)
-                                            } else if tag.starts_with("graalpy") {
-                                                Some(InterpreterKind::GraalPy)
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                        .context("unsupported Python interpreter")?;
-                                    interpreters.push(PythonInterpreter {
-                                        config: InterpreterConfig {
-                                            major,
-                                            minor,
-                                            interpreter_kind,
-                                            abiflags,
-                                            ext_suffix: ext_suffix.to_string(),
-                                            pointer_width: None,
-                                            gil_disabled,
-                                        },
-                                        executable: PathBuf::new(),
-                                        platform: None,
-                                        runnable: false,
-                                        implementation_name: interpreter_kind
-                                            .to_string()
-                                            .to_ascii_lowercase(),
-                                        soabi: soabi.cloned(),
-                                    });
-                                }
-                            } else {
-                                if interpreter.is_empty() && !self.find_interpreter {
-                                    bail!(
-                                        "Couldn't find any python interpreters. Please specify at least one with -i"
-                                    );
-                                }
-                                for interp in interpreter {
-                                    // If `-i` looks like a file path, check if it's a valid interpreter
-                                    if interp.components().count() > 1
-                                        && PythonInterpreter::check_executable(
-                                            interp, target, bridge,
-                                        )?
-                                        .is_none()
-                                    {
-                                        bail!(
-                                            "{} is not a valid python interpreter",
-                                            interp.display()
-                                        );
-                                    }
-                                }
-                                interpreters = find_interpreter_in_sysconfig(
-                                    bridge,
-                                    interpreter,
-                                    target,
-                                    requires_python,
-                                )?;
-                                if interpreters.is_empty() {
-                                    bail!(
-                                        "Couldn't find any python interpreters from '{}'. Please check that both major and minor python version have been specified in -i/--interpreter.",
-                                        interpreter
-                                            .iter()
-                                            .map(|p| p.display().to_string())
-                                            .collect::<Vec<_>>()
-                                            .join(", ")
-                                    );
-                                }
-                            }
-                        } else {
-                            interpreters = find_interpreter(
-                                bridge,
-                                interpreter,
-                                target,
-                                requires_python,
-                                generate_import_lib,
-                            )?;
-                        }
-
-                        let interpreters_str = interpreters
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect::<Vec<String>>()
-                            .join(", ");
-                        eprintln!("🐍 Found {interpreters_str}");
-
-                        Ok(interpreters)
-                    }
-                    Some(Abi3Version::Version(major, minor)) => {
-                        let found_interpreters =
-                            find_interpreter_in_host(bridge, interpreter, target, requires_python)
-                                .or_else(|err| {
-                                    // Can only use sysconfig-derived interpreter on windows if generating the import lib
-                                    if target.is_windows() && !generate_import_lib {
-                                        return Err(err.context("Need a Python interpreter to compile for Windows without PyO3's `generate-import-lib` feature"));
-                                    }
-
-                                    let interps =
-                                        find_interpreter_in_sysconfig(bridge, interpreter, target, requires_python)
-                                            .unwrap_or_default();
-                                    if interps.is_empty() && !self.interpreter.is_empty() {
-                                        // Print error when user supplied `--interpreter` option
-                                        Err(err)
-                                    } else {
-                                        Ok(interps)
-                                    }
-                                })?;
-
-                        if target.is_windows() {
-                            // On windows we might need a Python executable to locate a base prefix for
-                            // linker args, if we're not using PyO3's `generate-import-lib` feature.
-                            if env::var_os("PYO3_CROSS_LIB_DIR").is_some() {
-                                // PYO3_CROSS_LIB_DIR should point to the `libs` directory inside base_prefix
-                                // when cross compiling, so we fake a python interpreter matching it
-                                eprintln!("⚠️  Cross-compiling is poorly supported");
-                                Ok(vec![PythonInterpreter {
-                                    config: InterpreterConfig {
-                                        major: *major as usize,
-                                        minor: *minor as usize,
-                                        interpreter_kind: InterpreterKind::CPython,
-                                        abiflags: "".to_string(),
-                                        ext_suffix: ".pyd".to_string(),
-                                        pointer_width: None,
-                                        gil_disabled: false,
-                                    },
-                                    executable: PathBuf::new(),
-                                    platform: None,
-                                    runnable: false,
-                                    implementation_name: "cpython".to_string(),
-                                    soabi: None,
-                                }])
-                            } else if let Some(config_file) = env::var_os("PYO3_CONFIG_FILE") {
-                                let interpreter_config = InterpreterConfig::from_pyo3_config(
-                                    config_file.as_ref(),
-                                    target,
-                                )
-                                .context("Invalid PYO3_CONFIG_FILE")?;
-                                Ok(vec![PythonInterpreter::from_config(interpreter_config)])
-                            } else if generate_import_lib {
-                                eprintln!(
-                                    "🐍 Not using a specific python interpreter (automatically generating windows import library)"
-                                );
-                                let mut found_interpreters = found_interpreters;
-                                // fake a python interpreter if none directly found
-                                if found_interpreters.is_empty() {
-                                    found_interpreters.push(PythonInterpreter {
-                                        config: InterpreterConfig {
-                                            major: *major as usize,
-                                            minor: *minor as usize,
-                                            interpreter_kind: InterpreterKind::CPython,
-                                            abiflags: "".to_string(),
-                                            ext_suffix: ".pyd".to_string(),
-                                            pointer_width: None,
-                                            gil_disabled: false,
-                                        },
-                                        executable: PathBuf::new(),
-                                        platform: None,
-                                        runnable: false,
-                                        implementation_name: "cpython".to_string(),
-                                        soabi: None,
-                                    })
-                                }
-                                Ok(found_interpreters)
-                            } else {
-                                if found_interpreters.is_empty() {
-                                    bail!("Failed to find any python interpreter");
-                                }
-                                Ok(found_interpreters)
-                            }
-                        } else if target.cross_compiling() {
-                            let mut interps = Vec::with_capacity(found_interpreters.len());
-                            let mut pypys = Vec::new();
-                            for interp in found_interpreters {
-                                if interp.interpreter_kind.is_pypy() {
-                                    pypys.push(PathBuf::from(format!(
-                                        "pypy{}.{}",
-                                        interp.major, interp.minor
-                                    )));
-                                } else {
-                                    interps.push(interp);
-                                }
-                            }
-                            // cross compiling to PyPy with abi3 feature enabled,
-                            // we cannot use host pypy so switch to bundled sysconfig instead
-                            if !pypys.is_empty() {
-                                interps.extend(find_interpreter_in_sysconfig(
-                                    bridge,
-                                    &pypys,
-                                    target,
-                                    requires_python,
-                                )?)
-                            }
-                            if interps.is_empty() {
-                                bail!("Failed to find any python interpreter");
-                            }
-                            Ok(interps)
-                        } else if !found_interpreters.is_empty() {
-                            let interpreters_str = found_interpreters
-                                .iter()
-                                .map(ToString::to_string)
-                                .collect::<Vec<String>>()
-                                .join(", ");
-                            eprintln!("🐍 Found {interpreters_str}");
-
-                            Ok(found_interpreters)
-                        } else if self.interpreter.is_empty() {
-                            eprintln!("🐍 Not using a specific python interpreter");
-                            // Fake one to make `BuildContext::build_wheels` happy for abi3 when no cpython/pypy found on host
-                            // The python interpreter config doesn't matter, as it's not used for anything
-                            Ok(vec![PythonInterpreter {
-                                config: InterpreterConfig {
-                                    major: *major as usize,
-                                    minor: *minor as usize,
-                                    interpreter_kind: InterpreterKind::CPython,
-                                    abiflags: "".to_string(),
-                                    ext_suffix: "".to_string(),
-                                    pointer_width: None,
-                                    gil_disabled: false,
-                                },
-                                executable: PathBuf::new(),
-                                platform: None,
-                                runnable: false,
-                                implementation_name: "cpython".to_string(),
-                                soabi: None,
-                            }])
-                        } else {
-                            bail!("Failed to find any python interpreter");
-                        }
-                    }
-                }
-            }
-            BridgeModel::Cffi => {
-                let interpreter =
-                    find_single_python_interpreter(bridge, interpreter, target, "cffi")?;
-                eprintln!("🐍 Using {interpreter} to generate the cffi bindings");
-                Ok(vec![interpreter])
-            }
-            BridgeModel::Bin(None) | BridgeModel::UniFfi => Ok(vec![]),
-        }
-    }
-
     /// Tries to fill the missing metadata for a BuildContext by querying cargo and python
     #[instrument(skip_all)]
     pub fn into_build_context(self) -> BuildContextBuilder {
@@ -672,7 +320,6 @@ impl BuildContextBuilder {
         )?;
         let pyproject = pyproject_toml.as_ref();
 
-        let extra_pyo3_features = pyo3_features_from_conditional(pyproject);
         let bridge = find_bridge(
             &cargo_metadata,
             build_options.bindings.as_deref().or_else(|| {
@@ -683,7 +330,7 @@ impl BuildContextBuilder {
                     x.bindings()
                 })
             }),
-            &extra_pyo3_features,
+            pyproject,
         )?;
         debug!("Resolved bridge model: {:?}", bridge);
 
@@ -695,60 +342,10 @@ impl BuildContextBuilder {
             );
         }
 
-        let mut target_triple = build_options.target.clone();
-
-        let mut universal2 = target_triple == Some(TargetTriple::Universal2);
-        // Also try to determine universal2 from ARCHFLAGS environment variable
-        if target_triple.is_none()
-            && let Ok(arch_flags) = env::var("ARCHFLAGS")
-        {
-            let arches: HashSet<&str> = arch_flags
-                .split("-arch")
-                .filter_map(|x| {
-                    let x = x.trim();
-                    if x.is_empty() { None } else { Some(x) }
-                })
-                .collect();
-            match (arches.contains("x86_64"), arches.contains("arm64")) {
-                (true, true) => universal2 = true,
-                (true, false) => {
-                    target_triple = Some(TargetTriple::Regular("x86_64-apple-darwin".to_string()))
-                }
-                (false, true) => {
-                    target_triple = Some(TargetTriple::Regular("aarch64-apple-darwin".to_string()))
-                }
-                (false, false) => {}
-            }
-        };
-        if universal2 {
-            // Ensure that target_triple is valid. This is necessary to properly
-            // infer the platform tags when cross-compiling from Linux.
-            target_triple = Some(TargetTriple::Regular("aarch64-apple-darwin".to_string()));
-        }
-
-        let mut target = Target::from_target_triple(target_triple.as_ref())?;
-        if !target.user_specified && !universal2 {
-            if let Some(interpreter) = build_options.interpreter.first() {
-                // If there's an explicitly provided interpreter, check to see
-                // if it's a cross-compiling interpreter; otherwise, check to
-                // see if an target change is required.
-                if let Some(detected_target) = detect_target_from_cross_python(interpreter) {
-                    target = Target::from_target_triple(Some(&detected_target))?;
-                } else if let Some(detected_target) = detect_arch_from_python(interpreter, &target)
-                {
-                    target = Target::from_target_triple(Some(&detected_target))?;
-                }
-            } else {
-                // If there's no explicit user-provided target or interpreter,
-                // check the interpreter; if the interpreter identifies as a
-                // cross compiler, set the target based on the platform reported
-                // by the interpreter.
-                if let Some(detected_target) = detect_target_from_cross_python(&target.get_python())
-                {
-                    target = Target::from_target_triple(Some(&detected_target))?;
-                }
-            }
-        }
+        let (target, universal2) = resolve_target(
+            build_options.target.clone(),
+            build_options.interpreter.first(),
+        )?;
 
         let wheel_dir = match build_options.out {
             Some(ref dir) => dir.clone(),
@@ -756,18 +353,41 @@ impl BuildContextBuilder {
         };
 
         let generate_import_lib = is_generating_import_lib(&cargo_metadata)?;
-        let interpreter = if sdist_only && env::var_os("MATURIN_TEST_PYTHON").is_none() {
-            // We don't need a python interpreter to build sdist only
-            Vec::new()
-        } else {
-            resolve_interpreters(
-                &build_options,
-                &bridge,
-                &target,
-                metadata24.requires_python.as_ref(),
-                generate_import_lib,
-            )?
-        };
+        let (interpreter, host_python) =
+            if sdist_only && env::var_os("MATURIN_TEST_PYTHON").is_none() {
+                // We don't need a python interpreter to build sdist only
+                (Vec::new(), None)
+            } else {
+                let mut user_interpreters = build_options.interpreter.clone();
+
+                // In test mode, allow MATURIN_TEST_PYTHON to override the default
+                if cfg!(test)
+                    && user_interpreters.is_empty()
+                    && !build_options.find_interpreter
+                    && let Some(python) = env::var_os("MATURIN_TEST_PYTHON")
+                {
+                    user_interpreters = vec![python.into()];
+                }
+
+                let resolver = InterpreterResolver::new(
+                    &target,
+                    &bridge,
+                    metadata24.requires_python.as_ref(),
+                    &user_interpreters,
+                    build_options.find_interpreter,
+                    generate_import_lib,
+                );
+                resolver.resolve()?
+            };
+
+        // Set PYO3_PYTHON for cross-compilation so pyo3's build script
+        // can find the host interpreter.
+        if let Some(ref host_python) = host_python {
+            unsafe {
+                env::set_var("PYO3_PYTHON", host_python);
+                env::set_var("PYTHON_SYS_EXECUTABLE", host_python);
+            }
+        }
 
         if cargo_options.args.is_empty() {
             // if not supplied on command line, try pyproject.toml
@@ -813,70 +433,15 @@ impl BuildContextBuilder {
             Some(config)
         };
 
-        let platform_tags = if build_options.platform_tag.is_empty() {
+        let platform_tags = resolve_platform_tags(
+            build_options.platform_tag,
+            &target,
+            &bridge,
+            pyproject,
+            &mut pyproject_toml_maturin_options,
             #[cfg(feature = "zig")]
-            let use_zig = build_options.zig;
-            #[cfg(not(feature = "zig"))]
-            let use_zig = false;
-            let compatibility = pyproject
-                .and_then(|x| {
-                    if x.compatibility().is_some() {
-                        pyproject_toml_maturin_options.push("compatibility");
-                    }
-                    x.compatibility()
-                })
-                .or(if use_zig {
-                    if target.is_musl_libc() {
-                        // Zig bundles musl 1.2
-                        Some(PlatformTag::Musllinux { major: 1, minor: 2 })
-                    } else {
-                        // With zig we can compile to any glibc version that we want, so we pick the lowest
-                        // one supported by the rust compiler
-                        Some(target.get_minimum_manylinux_tag())
-                    }
-                } else {
-                    // Defaults to musllinux_1_2 for musl target if it's not bin bindings
-                    if target.is_musl_libc() && !bridge.is_bin() {
-                        Some(PlatformTag::Musllinux { major: 1, minor: 2 })
-                    } else {
-                        None
-                    }
-                });
-            if let Some(platform_tag) = compatibility {
-                vec![platform_tag]
-            } else {
-                Vec::new()
-            }
-        } else if let [PlatformTag::Pypi] = &build_options.platform_tag[..] {
-            // Avoid building for architectures we already know aren't allowed on PyPI
-            if !is_arch_supported_by_pypi(&target) {
-                bail!("Rust target {target} is not supported by PyPI");
-            }
-            // The defaults are already targeting PyPI: manylinux on linux,
-            // and the native tag on windows and mac
-            Vec::new()
-        } else {
-            if build_options.platform_tag.iter().any(|tag| tag.is_pypi())
-                && !is_arch_supported_by_pypi(&target)
-            {
-                bail!("Rust target {target} is not supported by PyPI");
-            }
-
-            // All non-PyPI tags - use as-is
-            build_options
-                .platform_tag
-                .into_iter()
-                .filter(|platform_tag| platform_tag != &PlatformTag::Pypi)
-                .collect()
-        };
-
-        for platform_tag in &platform_tags {
-            if !platform_tag.is_supported() {
-                eprintln!("⚠️  Warning: {platform_tag} is unsupported by the Rust compiler.");
-            } else if platform_tag.is_musllinux() && !target.is_musl_libc() {
-                eprintln!("⚠️  Warning: {target} is not compatible with {platform_tag}.");
-            }
-        }
+            build_options.zig,
+        )?;
 
         validate_bridge_type(&bridge, &target, &platform_tags)?;
 
@@ -956,47 +521,119 @@ impl BuildContextBuilder {
     }
 }
 
-fn resolve_interpreters(
-    build_options: &BuildOptions,
-    bridge: &BridgeModel,
-    target: &Target,
-    requires_python: Option<&VersionSpecifiers>,
-    generate_import_lib: bool,
-) -> Result<Vec<PythonInterpreter>> {
-    let interpreter = if build_options.find_interpreter {
-        // Auto-detect interpreters
-        build_options.find_interpreters(
-            bridge,
-            &[],
-            target,
-            requires_python,
-            generate_import_lib,
-        )?
-    } else {
-        // User given list of interpreters
-        let interpreter = if build_options.interpreter.is_empty() && !target.cross_compiling() {
-            if cfg!(test) {
-                match env::var_os("MATURIN_TEST_PYTHON") {
-                    Some(python) => vec![python.into()],
-                    None => vec![target.get_python()],
-                }
-            } else {
-                let python = if bridge.is_pyo3() {
-                    std::env::var("PYO3_PYTHON")
-                        .ok()
-                        .map(PathBuf::from)
-                        .unwrap_or_else(|| target.get_python())
-                } else {
-                    target.get_python()
-                };
-                vec![python]
+/// Resolve the build target and universal2 flag from the user-specified
+/// target triple (or `ARCHFLAGS`) and the first interpreter (if any).
+fn resolve_target(
+    target_triple: Option<TargetTriple>,
+    first_interpreter: Option<&PathBuf>,
+) -> Result<(Target, bool)> {
+    let mut target_triple = target_triple;
+    let mut universal2 = target_triple == Some(TargetTriple::Universal2);
+
+    // Also try to determine universal2 from ARCHFLAGS environment variable
+    if target_triple.is_none()
+        && let Ok(arch_flags) = env::var("ARCHFLAGS")
+    {
+        let arches: HashSet<&str> = arch_flags
+            .split("-arch")
+            .filter_map(|x| {
+                let x = x.trim();
+                if x.is_empty() { None } else { Some(x) }
+            })
+            .collect();
+        match (arches.contains("x86_64"), arches.contains("arm64")) {
+            (true, true) => universal2 = true,
+            (true, false) => {
+                target_triple = Some(TargetTriple::Regular("x86_64-apple-darwin".to_string()))
             }
-        } else {
-            build_options.interpreter.clone()
-        };
-        build_options.find_interpreters(bridge, &interpreter, target, None, generate_import_lib)?
+            (false, true) => {
+                target_triple = Some(TargetTriple::Regular("aarch64-apple-darwin".to_string()))
+            }
+            (false, false) => {}
+        }
     };
-    Ok(interpreter)
+    if universal2 {
+        target_triple = Some(TargetTriple::Regular("aarch64-apple-darwin".to_string()));
+    }
+
+    let mut target = Target::from_target_triple(target_triple.as_ref())?;
+    if !target.user_specified && !universal2 {
+        if let Some(interpreter) = first_interpreter {
+            if let Some(detected_target) = detect_target_from_cross_python(interpreter) {
+                target = Target::from_target_triple(Some(&detected_target))?;
+            } else if let Some(detected_target) = detect_arch_from_python(interpreter, &target) {
+                target = Target::from_target_triple(Some(&detected_target))?;
+            }
+        } else if let Some(detected_target) = detect_target_from_cross_python(&target.get_python())
+        {
+            target = Target::from_target_triple(Some(&detected_target))?;
+        }
+    }
+
+    Ok((target, universal2))
+}
+
+/// Resolve platform tags from CLI flags, pyproject.toml, and target properties.
+fn resolve_platform_tags(
+    user_tags: Vec<PlatformTag>,
+    target: &Target,
+    bridge: &BridgeModel,
+    pyproject: Option<&crate::pyproject_toml::PyProjectToml>,
+    pyproject_options: &mut Vec<&str>,
+    #[cfg(feature = "zig")] use_zig: bool,
+) -> Result<Vec<PlatformTag>> {
+    let platform_tags = if user_tags.is_empty() {
+        #[cfg(feature = "zig")]
+        let zig = use_zig;
+        #[cfg(not(feature = "zig"))]
+        let zig = false;
+        let compatibility = pyproject
+            .and_then(|x| {
+                if x.compatibility().is_some() {
+                    pyproject_options.push("compatibility");
+                }
+                x.compatibility()
+            })
+            .or(if zig {
+                if target.is_musl_libc() {
+                    Some(PlatformTag::Musllinux { major: 1, minor: 2 })
+                } else {
+                    Some(target.get_minimum_manylinux_tag())
+                }
+            } else if target.is_musl_libc() && !bridge.is_bin() {
+                Some(PlatformTag::Musllinux { major: 1, minor: 2 })
+            } else {
+                None
+            });
+        if let Some(platform_tag) = compatibility {
+            vec![platform_tag]
+        } else {
+            Vec::new()
+        }
+    } else if let [PlatformTag::Pypi] = &user_tags[..] {
+        if !is_arch_supported_by_pypi(target) {
+            bail!("Rust target {target} is not supported by PyPI");
+        }
+        Vec::new()
+    } else {
+        if user_tags.iter().any(|tag| tag.is_pypi()) && !is_arch_supported_by_pypi(target) {
+            bail!("Rust target {target} is not supported by PyPI");
+        }
+        user_tags
+            .into_iter()
+            .filter(|platform_tag| platform_tag != &PlatformTag::Pypi)
+            .collect()
+    };
+
+    for platform_tag in &platform_tags {
+        if !platform_tag.is_supported() {
+            eprintln!("⚠️  Warning: {platform_tag} is unsupported by the Rust compiler.");
+        } else if platform_tag.is_musllinux() && !target.is_musl_libc() {
+            eprintln!("⚠️  Warning: {target} is not compatible with {platform_tag}.");
+        }
+    }
+
+    Ok(platform_tags)
 }
 
 /// Checks for bridge/platform type edge cases
@@ -1128,553 +765,6 @@ fn filter_cargo_targets(
     }
 
     Ok(targets)
-}
-
-/// Extract pyo3/pyo3-ffi feature names from conditional features in pyproject.toml.
-///
-/// For a conditional feature like `pyo3/abi3-py311`, this extracts `abi3-py311`
-/// for the corresponding binding crate.
-pub fn pyo3_features_from_conditional(
-    pyproject: Option<&crate::PyProjectToml>,
-) -> HashMap<&'static str, Vec<String>> {
-    let mut extra: HashMap<&'static str, Vec<String>> = HashMap::new();
-    let features = match pyproject
-        .and_then(|p| p.maturin())
-        .and_then(|m| m.features.as_ref())
-    {
-        Some(f) => f,
-        None => return extra,
-    };
-    let crate_names: &[&'static str] = &["pyo3", "pyo3-ffi"];
-    for spec in features {
-        let feature = match spec {
-            FeatureSpec::Plain(_) => continue,
-            FeatureSpec::Conditional { feature, .. } => feature,
-        };
-        for &crate_name in crate_names {
-            let prefix = format!("{crate_name}/");
-            if let Some(feat_name) = feature.strip_prefix(&prefix) {
-                extra
-                    .entry(crate_name)
-                    .or_default()
-                    .push(feat_name.to_string());
-            }
-        }
-    }
-    extra
-}
-
-/// pyo3 supports building abi3 wheels if the unstable-api feature is not selected
-fn has_abi3(
-    deps: &HashMap<&str, &Node>,
-    extra_features: &HashMap<&str, Vec<String>>,
-) -> Result<Option<Abi3Version>> {
-    for &lib in PYO3_BINDING_CRATES.iter() {
-        let lib = lib.as_str();
-        if let Some(&pyo3_crate) = deps.get(lib) {
-            let extra = extra_features.get(lib);
-            // Find the minimal abi3 python version. If there is none, abi3 hasn't been selected
-            // This parser abi3-py{major}{minor} and returns the minimal (major, minor) tuple
-            let all_features: Vec<&str> = pyo3_crate
-                .features
-                .iter()
-                .map(AsRef::as_ref)
-                .chain(extra.into_iter().flatten().map(String::as_str))
-                .collect();
-
-            let abi3_selected = all_features.contains(&"abi3");
-
-            let min_abi3_version = all_features
-                .iter()
-                .filter(|&&x| x.starts_with("abi3-py") && x.len() >= "abi3-pyxx".len())
-                .map(|x| {
-                    Ok((
-                        (x.as_bytes()[7] as char).to_string().parse::<u8>()?,
-                        x[8..].parse::<u8>()?,
-                    ))
-                })
-                .collect::<Result<Vec<(u8, u8)>>>()
-                .context(format!("Bogus {lib} cargo features"))?
-                .into_iter()
-                .min();
-            match min_abi3_version {
-                Some((major, minor)) => return Ok(Some(Abi3Version::Version(major, minor))),
-                None if abi3_selected => return Ok(Some(Abi3Version::CurrentPython)),
-                None => {}
-            }
-        }
-    }
-    Ok(None)
-}
-
-/// pyo3 0.16.4+ supports building abi3 wheels without a working Python interpreter for Windows
-/// when `generate-import-lib` feature is enabled
-fn is_generating_import_lib(cargo_metadata: &Metadata) -> Result<bool> {
-    let resolve = cargo_metadata
-        .resolve
-        .as_ref()
-        .context("Expected cargo to return metadata with resolve")?;
-    for &lib in PYO3_BINDING_CRATES.iter().rev() {
-        let lib = lib.as_str();
-        let pyo3_packages = resolve
-            .nodes
-            .iter()
-            .filter(|package| cargo_metadata[&package.id].name.as_str() == lib)
-            .collect::<Vec<_>>();
-        match pyo3_packages.as_slice() {
-            &[pyo3_crate] => {
-                let generate_import_lib = pyo3_crate
-                    .features
-                    .iter()
-                    .map(AsRef::as_ref)
-                    .any(|x| x == "generate-import-lib" || x == "generate-abi3-import-lib");
-                return Ok(generate_import_lib);
-            }
-            _ => continue,
-        }
-    }
-    Ok(false)
-}
-
-/// Tries to determine the bindings type from dependency
-fn find_pyo3_bindings(
-    deps: &HashMap<&str, &Node>,
-    packages: &HashMap<&str, &cargo_metadata::Package>,
-) -> anyhow::Result<Option<PyO3>> {
-    use crate::bridge::PyO3MetadataRaw;
-
-    if deps.get("pyo3").is_some() {
-        let pyo3_metadata = match packages.get("pyo3-ffi") {
-            Some(pyo3_ffi) => pyo3_ffi.metadata.clone(),
-            None => {
-                // Old versions of pyo3 does not depend on pyo3-ffi,
-                // thus does not have the metadata
-                serde_json::Value::Null
-            }
-        };
-        let metadata = match serde_json::from_value::<Option<PyO3MetadataRaw>>(pyo3_metadata) {
-            Ok(Some(metadata)) => Some(metadata.try_into()?),
-            Ok(None) | Err(_) => None,
-        };
-        let version = packages["pyo3"].version.clone();
-        Ok(Some(PyO3 {
-            crate_name: PyO3Crate::PyO3,
-            version,
-            abi3: None,
-            metadata,
-        }))
-    } else if deps.get("pyo3-ffi").is_some() {
-        let package = &packages["pyo3-ffi"];
-        let version = package.version.clone();
-        let metadata =
-            match serde_json::from_value::<Option<PyO3MetadataRaw>>(package.metadata.clone()) {
-                Ok(Some(metadata)) => Some(metadata.try_into()?),
-                Ok(None) | Err(_) => None,
-            };
-        Ok(Some(PyO3 {
-            crate_name: PyO3Crate::PyO3Ffi,
-            version,
-            abi3: None,
-            metadata,
-        }))
-    } else {
-        Ok(None)
-    }
-}
-
-/// Return a map with all (transitive) dependencies of the *current* crate.
-/// This is different from `metadata.resolve`, which also includes packages
-/// that are used in the same workspace, but on which the current crate does not depend.
-fn current_crate_dependencies(cargo_metadata: &Metadata) -> Result<HashMap<&str, &Node>> {
-    let resolve = cargo_metadata
-        .resolve
-        .as_ref()
-        .context("Expected to get a dependency graph from cargo")?;
-    let root = resolve
-        .root
-        .as_ref()
-        .context("expected to get a root package")?;
-    let nodes: HashMap<&PackageId, &Node> =
-        resolve.nodes.iter().map(|node| (&node.id, node)).collect();
-
-    // Walk the dependency tree to get all (in)direct children.
-    let mut dep_ids = HashSet::with_capacity(nodes.len());
-    let mut todo = Vec::from([root]);
-    while let Some(id) = todo.pop() {
-        for dep in nodes[id].deps.iter() {
-            if dep_ids.contains(&dep.pkg) {
-                continue;
-            }
-            dep_ids.insert(&dep.pkg);
-            todo.push(&dep.pkg);
-        }
-    }
-
-    Ok(nodes
-        .into_iter()
-        .filter_map(|(id, node)| {
-            dep_ids
-                .contains(&id)
-                .then_some((cargo_metadata[id].name.as_ref(), node))
-        })
-        .collect())
-}
-
-/// Tries to determine the [BridgeModel] for the target crate
-pub fn find_bridge(
-    cargo_metadata: &Metadata,
-    bridge: Option<&str>,
-    extra_pyo3_features: &HashMap<&str, Vec<String>>,
-) -> Result<BridgeModel> {
-    let deps = current_crate_dependencies(cargo_metadata)?;
-    let packages: HashMap<&str, &cargo_metadata::Package> = cargo_metadata
-        .packages
-        .iter()
-        .filter_map(|pkg| {
-            let name = pkg.name.as_ref();
-            if name == "pyo3" || name == "pyo3-ffi" || name == "cpython" || name == "uniffi" {
-                Some((name, pkg))
-            } else {
-                None
-            }
-        })
-        .collect();
-    let root_package = cargo_metadata
-        .root_package()
-        .context("Expected cargo to return metadata with root_package")?;
-    let targets: Vec<_> = root_package
-        .targets
-        .iter()
-        .filter(|target| {
-            target.kind.iter().any(|kind| {
-                !matches!(
-                    kind,
-                    TargetKind::Bench
-                        | TargetKind::CustomBuild
-                        | TargetKind::Example
-                        | TargetKind::ProcMacro
-                        | TargetKind::Test
-                )
-            })
-        })
-        .flat_map(|target| target.crate_types.iter().cloned())
-        .collect();
-
-    let bridge = if let Some(bindings) = bridge {
-        if bindings == "cffi" {
-            BridgeModel::Cffi
-        } else if bindings == "uniffi" {
-            BridgeModel::UniFfi
-        } else if bindings == "bin" {
-            let bindings = find_pyo3_bindings(&deps, &packages)?;
-            BridgeModel::Bin(bindings)
-        } else {
-            let bindings = find_pyo3_bindings(&deps, &packages)?.context("unknown binding type")?;
-            BridgeModel::PyO3(bindings)
-        }
-    } else {
-        match find_pyo3_bindings(&deps, &packages)? {
-            Some(bindings) => {
-                if !targets.contains(&CrateType::CDyLib) && targets.contains(&CrateType::Bin) {
-                    BridgeModel::Bin(Some(bindings))
-                } else {
-                    BridgeModel::PyO3(bindings)
-                }
-            }
-            _ => {
-                if deps.contains_key("uniffi") {
-                    BridgeModel::UniFfi
-                } else if targets.contains(&CrateType::CDyLib) {
-                    BridgeModel::Cffi
-                } else if targets.contains(&CrateType::Bin) {
-                    BridgeModel::Bin(find_pyo3_bindings(&deps, &packages)?)
-                } else {
-                    bail!(
-                        "Couldn't detect the binding type; Please specify them with --bindings/-b"
-                    )
-                }
-            }
-        }
-    };
-
-    if !bridge.is_pyo3() {
-        eprintln!("🔗 Found {bridge} bindings");
-        return Ok(bridge);
-    }
-
-    for &lib in PYO3_BINDING_CRATES.iter() {
-        if !bridge.is_bin() && bridge.is_pyo3_crate(lib) {
-            let lib_name = lib.as_str();
-            let pyo3_node = deps[lib_name];
-            if !pyo3_node
-                .features
-                .iter()
-                .map(AsRef::as_ref)
-                .any(|f| f == "extension-module")
-            {
-                let version = &cargo_metadata[&pyo3_node.id].version;
-                if (version.major, version.minor) < (0, 26) {
-                    // pyo3 0.26+ will use the `PYO3_BUILD_EXTENSION_MODULE` env var instead
-                    eprintln!(
-                        "⚠️  Warning: You're building a library without activating {lib}'s \
-                        `extension-module` feature. \
-                        See https://pyo3.rs/v{version}/building-and-distribution.html#the-extension-module-feature"
-                    );
-                }
-            }
-
-            return if let Some(abi3_version) = has_abi3(&deps, extra_pyo3_features)? {
-                eprintln!("🔗 Found {lib} bindings with abi3 support");
-                let pyo3 = bridge.pyo3().expect("should be pyo3 bindings");
-                let bindings = PyO3 {
-                    crate_name: lib,
-                    version: pyo3.version.clone(),
-                    abi3: Some(abi3_version),
-                    metadata: pyo3.metadata.clone(),
-                };
-                Ok(BridgeModel::PyO3(bindings))
-            } else {
-                eprintln!("🔗 Found {lib} bindings");
-                Ok(bridge)
-            };
-        }
-    }
-
-    Ok(bridge)
-}
-
-/// Shared between cffi and pyo3-abi3
-fn find_single_python_interpreter(
-    bridge: &BridgeModel,
-    interpreter: &[PathBuf],
-    target: &Target,
-    bridge_name: &str,
-) -> Result<PythonInterpreter> {
-    let interpreter_str = interpreter
-        .iter()
-        .map(|interpreter| format!("`{}`", interpreter.display()))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let err_message = format!("Failed to find a python interpreter from {interpreter_str}");
-
-    let executable = if interpreter.is_empty() {
-        target.get_python()
-    } else if interpreter.len() == 1 {
-        interpreter[0].clone()
-    } else {
-        bail!(
-            "You can only specify one python interpreter for {}",
-            bridge_name
-        );
-    };
-
-    let interpreter = PythonInterpreter::check_executable(executable, target, bridge)
-        .context(format_err!(err_message.clone()))?
-        .ok_or_else(|| format_err!(err_message))?;
-    Ok(interpreter)
-}
-
-/// Find python interpreters in host machine first,
-/// fallback to bundled sysconfig if not found in host machine
-fn find_interpreter(
-    bridge: &BridgeModel,
-    interpreter: &[PathBuf],
-    target: &Target,
-    requires_python: Option<&VersionSpecifiers>,
-    generate_import_lib: bool,
-) -> Result<Vec<PythonInterpreter>> {
-    let mut found_interpreters = Vec::new();
-    if !interpreter.is_empty() {
-        let mut missing = Vec::new();
-        for interp in interpreter {
-            match PythonInterpreter::check_executable(interp.clone(), target, bridge)? {
-                Some(interp) => found_interpreters.push(interp),
-                None => missing.push(interp.clone()),
-            }
-        }
-        if !missing.is_empty() {
-            let sysconfig_interps =
-                find_interpreter_in_sysconfig(bridge, &missing, target, requires_python)?;
-
-            // Can only use sysconfig-derived interpreter on windows if generating the import lib
-            if !sysconfig_interps.is_empty() && target.is_windows() && !generate_import_lib {
-                let found = sysconfig_interps
-                    .iter()
-                    .map(|i| format!("{} {}.{}", i.interpreter_kind, i.major, i.minor))
-                    .collect::<Vec<_>>();
-                bail!(
-                    "Interpreters {found:?} were found in maturin's bundled sysconfig, but compiling for Windows without an interpreter requires PyO3's `generate-import-lib` feature"
-                );
-            }
-
-            found_interpreters.extend(sysconfig_interps);
-        }
-    } else {
-        found_interpreters = PythonInterpreter::find_all(target, bridge, requires_python)
-            .context("Finding python interpreters failed")?;
-    };
-
-    if found_interpreters.is_empty() {
-        if interpreter.is_empty() {
-            if let Some(requires_python) = requires_python {
-                bail!(
-                    "Couldn't find any python interpreters with version {}. Please specify at least one with -i",
-                    requires_python
-                );
-            } else {
-                bail!("Couldn't find any python interpreters. Please specify at least one with -i");
-            }
-        } else {
-            let interps_str = interpreter
-                .iter()
-                .map(|path| format!("'{}'", path.display()))
-                .collect::<Vec<_>>()
-                .join(", ");
-            bail!(
-                "Couldn't find any python interpreters from {}.",
-                interps_str
-            );
-        }
-    }
-    Ok(found_interpreters)
-}
-
-/// Find python interpreters in the host machine
-fn find_interpreter_in_host(
-    bridge: &BridgeModel,
-    interpreter: &[PathBuf],
-    target: &Target,
-    requires_python: Option<&VersionSpecifiers>,
-) -> Result<Vec<PythonInterpreter>> {
-    let interpreters = if !interpreter.is_empty() {
-        PythonInterpreter::check_executables(interpreter, target, bridge)?
-    } else {
-        PythonInterpreter::find_all(target, bridge, requires_python)
-            .context("Finding python interpreters failed")?
-    };
-
-    if interpreters.is_empty() {
-        if let Some(requires_python) = requires_python {
-            bail!(
-                "Couldn't find any python interpreters with {}. Please specify at least one with -i",
-                requires_python
-            );
-        } else {
-            bail!("Couldn't find any python interpreters. Please specify at least one with -i");
-        }
-    }
-    Ok(interpreters)
-}
-
-/// Find python interpreters in the bundled sysconfig
-fn find_interpreter_in_sysconfig(
-    bridge: &BridgeModel,
-    interpreter: &[PathBuf],
-    target: &Target,
-    requires_python: Option<&VersionSpecifiers>,
-) -> Result<Vec<PythonInterpreter>> {
-    if interpreter.is_empty() {
-        return Ok(PythonInterpreter::find_by_target(
-            target,
-            requires_python,
-            Some(bridge),
-        ));
-    }
-    let mut interpreters = Vec::new();
-    for interp in interpreter {
-        let python = interp.display().to_string();
-        let (python_impl, python_ver, abiflags) = if let Some(ver) = python.strip_prefix("pypy") {
-            (
-                InterpreterKind::PyPy,
-                ver.strip_prefix('-').unwrap_or(ver),
-                "",
-            )
-        } else if let Some(ver) = python.strip_prefix("graalpy") {
-            (
-                InterpreterKind::GraalPy,
-                ver.strip_prefix('-').unwrap_or(ver),
-                "",
-            )
-        } else if let Some(ver) = python.strip_prefix("python") {
-            // Also accept things like `python3.13t` for free-threaded python
-            let (ver, abiflags) = maybe_free_threaded(ver.strip_prefix('-').unwrap_or(ver));
-            (InterpreterKind::CPython, ver, abiflags)
-        } else if python
-            .chars()
-            .next()
-            .map(|c| c.is_ascii_digit())
-            .unwrap_or(false)
-        {
-            // Eg: -i 3.9 without interpreter kind, assume it's CPython
-            let (ver, abiflags) = maybe_free_threaded(&python);
-            (InterpreterKind::CPython, ver, abiflags)
-        } else {
-            // if interpreter not known
-            if std::path::Path::new(&python).is_file() {
-                bail!(
-                    "Python interpreter should be a kind of interpreter (e.g. 'python3.14' or 'pypy3.11') when cross-compiling, got path to interpreter: {}",
-                    python
-                );
-            } else {
-                bail!(
-                    "Unsupported Python interpreter for cross-compilation: {}; supported interpreters are pypy, graalpy, and python (cpython)",
-                    python
-                );
-            }
-        };
-        if python_ver.is_empty() {
-            continue;
-        }
-        let (ver_major, ver_minor) = python_ver
-            .split_once('.')
-            .context("Invalid python interpreter version")?;
-        let ver_major = ver_major.parse::<usize>().with_context(|| {
-            format!("Invalid python interpreter major version '{ver_major}', expect a digit")
-        })?;
-        let ver_minor = ver_minor.parse::<usize>().with_context(|| {
-            format!("Invalid python interpreter minor version '{ver_minor}', expect a digit")
-        })?;
-
-        if (ver_major, ver_minor) < (3, 13) && abiflags == "t" {
-            bail!("Free-threaded Python interpreter is only supported on 3.13 and later.");
-        }
-
-        let sysconfig = InterpreterConfig::lookup_one(target, python_impl, (ver_major, ver_minor), abiflags)
-            .with_context(|| {
-                format!("Failed to find a {python_impl} {ver_major}.{ver_minor} interpreter in known sysconfig")
-            })?;
-        debug!(
-            "Found {} {}.{}{} in bundled sysconfig",
-            sysconfig.interpreter_kind, sysconfig.major, sysconfig.minor, sysconfig.abiflags
-        );
-        interpreters.push(PythonInterpreter::from_config(sysconfig.clone()));
-    }
-    Ok(interpreters)
-}
-
-/// Derive SOABI from an extension suffix.
-///
-/// For example, `.cpython-314-x86_64-linux-gnu.so` becomes
-/// `cpython-314-x86_64-linux-gnu`.
-fn soabi_from_ext_suffix(ext_suffix: &str) -> Option<String> {
-    let s = ext_suffix.strip_prefix('.')?;
-    let s = s
-        .strip_suffix(".so")
-        .or_else(|| s.strip_suffix(".pyd"))
-        .unwrap_or(s);
-    if s.is_empty() {
-        None
-    } else {
-        Some(s.to_string())
-    }
-}
-
-fn maybe_free_threaded(python_ver: &str) -> (&str, &str) {
-    if let Some(ver) = python_ver.strip_suffix('t') {
-        (ver, "t")
-    } else {
-        (python_ver, "")
-    }
 }
 
 /// We need to pass the global flags to cargo metadata
@@ -1863,6 +953,7 @@ impl CargoOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge::{Abi3Version, PyO3, PyO3Crate};
     use cargo_metadata::MetadataCommand;
     use insta::assert_snapshot;
     use pretty_assertions::assert_eq;
@@ -1875,13 +966,12 @@ mod tests {
             .exec()
             .unwrap();
 
-        let no_extra = HashMap::new();
         assert!(matches!(
-            find_bridge(&pyo3_mixed, None, &no_extra),
+            find_bridge(&pyo3_mixed, None, None),
             Ok(BridgeModel::PyO3 { .. })
         ));
         assert!(matches!(
-            find_bridge(&pyo3_mixed, Some("pyo3"), &no_extra),
+            find_bridge(&pyo3_mixed, Some("pyo3"), None),
             Ok(BridgeModel::PyO3 { .. })
         ));
     }
@@ -1910,12 +1000,8 @@ mod tests {
                 },
             }),
         });
-        let no_extra = HashMap::new();
-        assert_eq!(find_bridge(&pyo3_pure, None, &no_extra).unwrap(), bridge);
-        assert_eq!(
-            find_bridge(&pyo3_pure, Some("pyo3"), &no_extra).unwrap(),
-            bridge
-        );
+        assert_eq!(find_bridge(&pyo3_pure, None, None).unwrap(), bridge);
+        assert_eq!(find_bridge(&pyo3_pure, Some("pyo3"), None).unwrap(), bridge);
     }
 
     #[test]
@@ -1925,8 +1011,7 @@ mod tests {
             .exec()
             .unwrap();
 
-        let no_extra = HashMap::new();
-        assert!(find_bridge(&pyo3_pure, None, &no_extra).is_err());
+        assert!(find_bridge(&pyo3_pure, None, None).is_err());
 
         let pyo3_pure = MetadataCommand::new()
             .manifest_path(Path::new("test-crates/pyo3-feature").join("Cargo.toml"))
@@ -1935,7 +1020,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            find_bridge(&pyo3_pure, None, &no_extra).unwrap(),
+            find_bridge(&pyo3_pure, None, None).unwrap(),
             BridgeModel::PyO3 { .. }
         ));
     }
@@ -1947,17 +1032,16 @@ mod tests {
             .exec()
             .unwrap();
 
-        let no_extra = HashMap::new();
         assert_eq!(
-            find_bridge(&cffi_pure, Some("cffi"), &no_extra).unwrap(),
+            find_bridge(&cffi_pure, Some("cffi"), None).unwrap(),
             BridgeModel::Cffi
         );
         assert_eq!(
-            find_bridge(&cffi_pure, None, &no_extra).unwrap(),
+            find_bridge(&cffi_pure, None, None).unwrap(),
             BridgeModel::Cffi
         );
 
-        assert!(find_bridge(&cffi_pure, Some("pyo3"), &no_extra).is_err());
+        assert!(find_bridge(&cffi_pure, Some("pyo3"), None).is_err());
     }
 
     #[test]
@@ -1967,28 +1051,27 @@ mod tests {
             .exec()
             .unwrap();
 
-        let no_extra = HashMap::new();
         assert_eq!(
-            find_bridge(&hello_world, Some("bin"), &no_extra).unwrap(),
+            find_bridge(&hello_world, Some("bin"), None).unwrap(),
             BridgeModel::Bin(None)
         );
         assert_eq!(
-            find_bridge(&hello_world, None, &no_extra).unwrap(),
+            find_bridge(&hello_world, None, None).unwrap(),
             BridgeModel::Bin(None)
         );
 
-        assert!(find_bridge(&hello_world, Some("pyo3"), &no_extra).is_err());
+        assert!(find_bridge(&hello_world, Some("pyo3"), None).is_err());
 
         let pyo3_bin = MetadataCommand::new()
             .manifest_path(Path::new("test-crates/pyo3-bin").join("Cargo.toml"))
             .exec()
             .unwrap();
         assert!(matches!(
-            find_bridge(&pyo3_bin, Some("bin"), &no_extra).unwrap(),
+            find_bridge(&pyo3_bin, Some("bin"), None).unwrap(),
             BridgeModel::Bin(Some(_))
         ));
         assert!(matches!(
-            find_bridge(&pyo3_bin, None, &no_extra).unwrap(),
+            find_bridge(&pyo3_bin, None, None).unwrap(),
             BridgeModel::Bin(Some(_))
         ));
     }
@@ -2051,7 +1134,8 @@ mod tests {
         let bridge = BridgeModel::Cffi;
         let interpreter = vec![PathBuf::from("nonexistent-python-xyz")];
 
-        let result = find_single_python_interpreter(&bridge, &interpreter, &target, "cffi");
+        let resolver = InterpreterResolver::new(&target, &bridge, None, &interpreter, false, false);
+        let result = resolver.resolve();
         let err_msg = result.unwrap_err().to_string();
         assert_snapshot!(err_msg, @"Failed to find a python interpreter from `nonexistent-python-xyz`");
     }

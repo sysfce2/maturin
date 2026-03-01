@@ -6,7 +6,7 @@ use anyhow::Result;
 use clap::{ArgAction, Parser, ValueEnum};
 use fs_err as fs;
 
-use crate::build_options::find_bridge;
+use crate::bridge::find_bridge;
 use crate::project_layout::ProjectResolver;
 use crate::{BridgeModel, CargoOptions};
 
@@ -153,11 +153,10 @@ impl GenerateCI {
             ..
         } = ProjectResolver::resolve(self.manifest_path.clone(), cargo_options, false, None)?;
         let pyproject = pyproject_toml.as_ref();
-        let extra_pyo3_features = crate::build_options::pyo3_features_from_conditional(pyproject);
         let bridge = find_bridge(
             &cargo_metadata,
             pyproject.and_then(|x| x.bindings()),
-            &extra_pyo3_features,
+            pyproject,
         )?;
         let project_name = pyproject
             .and_then(|project| project.project_name())

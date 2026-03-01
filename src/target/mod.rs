@@ -742,13 +742,31 @@ impl Target {
 
     /// Returns the path to the python executable
     ///
-    /// For windows it's always python.exe for unix it's first the venv's `python`
-    /// and then `python3`
+    /// Checks in order: `VIRTUAL_ENV`'s python, `pythonLocation` (GitHub Actions),
+    /// and finally falls back to `python.exe` (Windows) or `python3` (Unix).
     pub fn get_python(&self) -> PathBuf {
+        if let Some(venv) = env::var_os("VIRTUAL_ENV") {
+            // Use the full path to the venv's python to ensure we get the
+            // correct version, rather than relying on PATH resolution (#2198)
+            let venv_python = self.get_venv_python(&venv);
+            if venv_python.exists() {
+                return venv_python;
+            }
+        }
+        // GitHub Actions setup-python sets pythonLocation to the install dir
+        if let Some(python_location) = env::var_os("pythonLocation") {
+            let python_location = Path::new(&python_location);
+            let python = if self.is_windows() {
+                python_location.join("python.exe")
+            } else {
+                python_location.join("bin").join("python3")
+            };
+            if python.exists() {
+                return python;
+            }
+        }
         if self.is_windows() {
             PathBuf::from("python.exe")
-        } else if env::var_os("VIRTUAL_ENV").is_some() {
-            PathBuf::from("python")
         } else {
             PathBuf::from("python3")
         }

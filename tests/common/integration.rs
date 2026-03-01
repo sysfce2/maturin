@@ -7,7 +7,7 @@ use cargo_zigbuild::Zig;
 use clap::Parser;
 use fs_err::File;
 use fs4::fs_err3::FileExt;
-use maturin::{BuildOptions, PlatformTag, PythonInterpreter, Target};
+use maturin::{BuildOptions, PlatformTag, Target};
 use normpath::PathExt;
 use std::collections::HashSet;
 use std::env;
@@ -146,7 +146,7 @@ pub fn test_integration(
     // For abi3 on unix, we didn't use a python interpreter, but we need one here
     let interpreter = if build_context.interpreter.is_empty() {
         let error_message = "python3 should be a python interpreter";
-        let venv_interpreter = PythonInterpreter::check_executable(
+        let venv_interpreter = maturin::PythonInterpreter::check_executable(
             python_interp.as_deref().unwrap_or("python3"),
             &build_context.target,
             build_context.bridge(),
