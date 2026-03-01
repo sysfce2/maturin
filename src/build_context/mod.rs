@@ -1,10 +1,14 @@
+mod builder;
+
+pub use builder::BuildContextBuilder;
+
 #[cfg(feature = "sbom")]
 use crate::auditwheel::get_sysroot_path;
 use crate::auditwheel::{AuditWheelMode, get_policy_and_libs, patchelf, relpath};
 use crate::auditwheel::{PlatformTag, Policy};
 use crate::binding_generator::{
-    BinBindingGenerator, CffiBindingGenerator, Pyo3BindingGenerator, UniFfiBindingGenerator,
-    generate_binding,
+    BinBindingGenerator, BindingGenerator, CffiBindingGenerator, Pyo3BindingGenerator,
+    UniFfiBindingGenerator, generate_binding,
 };
 use crate::bridge::Abi3Version;
 use crate::build_options::CargoOptions;
@@ -18,7 +22,7 @@ use crate::pyproject_toml::ConditionalFeature;
 use crate::sbom::{SbomData, generate_sbom_data, write_sboms};
 use crate::source_distribution::source_distribution;
 use crate::target::validate_wheel_filename_for_pypi;
-use crate::target::{Arch, Os};
+use crate::util::{hash_file, zip_mtime};
 use crate::{
     BridgeModel, BuildArtifact, Metadata24, PyProjectToml, PythonInterpreter, Target,
     VirtualWriter, compile, pyproject_toml::Format, pyproject_toml::SbomConfig,
@@ -30,74 +34,12 @@ use fs_err as fs;
 use ignore::overrides::{Override, OverrideBuilder};
 use lddtree::Library;
 use normpath::PathExt;
-use platform_info::*;
-use regex::Regex;
-use sha2::{Digest, Sha256};
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
-use std::io;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use tracing::instrument;
-use zip::DateTime;
-
-/// Unpacks an sdist tarball into a temporary directory and returns the path
-/// to the Cargo.toml and pyproject.toml inside it, along with the tempdir
-/// handle (which must be kept alive for the duration of the build).
-///
-/// The Cargo.toml path is resolved by checking `[tool.maturin.manifest-path]`
-/// in the sdist's `pyproject.toml`, falling back to `Cargo.toml` at the
-/// sdist root directory.
-pub fn unpack_sdist(sdist_path: &Path) -> Result<(tempfile::TempDir, PathBuf, PathBuf)> {
-    let tmp = tempfile::tempdir().context("Failed to create temporary directory")?;
-    let gz = flate2::read::GzDecoder::new(
-        fs::File::open(sdist_path)
-            .with_context(|| format!("Failed to open sdist {}", sdist_path.display()))?,
-    );
-    let mut archive = tar::Archive::new(gz);
-    archive
-        .unpack(tmp.path())
-        .context("Failed to unpack source distribution")?;
-
-    // The sdist contains a single top-level directory named <name>-<version>.
-    let entries: Vec<_> = fs::read_dir(tmp.path())
-        .context("Failed to read unpacked sdist directory")?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-        .collect();
-    let top_dir = match entries.len() {
-        // Canonicalize to resolve symlinks (e.g. /var -> /private/var on macOS).
-        // Without this, `project_root` and `python_dir` may disagree after
-        // `normalize()` is applied to only some paths, causing python source
-        // files to be silently excluded from wheels.
-        1 => dunce::canonicalize(entries[0].path()).unwrap_or_else(|_| entries[0].path()),
-        n => bail!(
-            "Expected exactly one top-level directory in sdist, found {}",
-            n
-        ),
-    };
-
-    // Resolve the Cargo.toml path: check pyproject.toml for [tool.maturin.manifest-path],
-    // otherwise default to Cargo.toml at the sdist root.
-    let pyproject_file = top_dir.join("pyproject.toml");
-    let cargo_toml = if pyproject_file.is_file() {
-        let pyproject = PyProjectToml::new(&pyproject_file)?;
-        if let Some(manifest_path) = pyproject.manifest_path() {
-            top_dir.join(manifest_path)
-        } else {
-            top_dir.join("Cargo.toml")
-        }
-    } else {
-        top_dir.join("Cargo.toml")
-    };
-    if !cargo_toml.exists() {
-        bail!(
-            "Cargo.toml not found in unpacked sdist at {}",
-            cargo_toml.display()
-        );
-    }
-    Ok((tmp, cargo_toml, pyproject_file))
-}
 
 /// Contains all the metadata required to build the crate
 #[derive(Clone)]
@@ -171,8 +113,6 @@ impl BuildContext {
     /// correct builder.
     #[instrument(skip_all)]
     pub fn build_wheels(&self) -> Result<Vec<BuiltWheelMetadata>> {
-        use itertools::Itertools;
-
         fs::create_dir_all(&self.out)
             .context("Failed to create the target directory for the wheels")?;
 
@@ -185,82 +125,9 @@ impl BuildContext {
             BridgeModel::Bin(Some(..)) => self.build_bin_wheels(&self.interpreter, &sbom_data)?,
             BridgeModel::PyO3(crate::PyO3 { abi3, .. }) => match abi3 {
                 Some(Abi3Version::Version(major, minor)) => {
-                    let abi3_interps: Vec<_> = self
-                        .interpreter
-                        .iter()
-                        .filter(|interp| {
-                            interp.has_stable_api()
-                                && (interp.major as u8, interp.minor as u8) >= (*major, *minor)
-                        })
-                        .cloned()
-                        .collect();
-                    let non_abi3_interps: Vec<_> = self
-                        .interpreter
-                        .iter()
-                        .filter(|interp| {
-                            !interp.has_stable_api()
-                                || (interp.major as u8, interp.minor as u8) < (*major, *minor)
-                        })
-                        .cloned()
-                        .collect();
-                    let mut built_wheels = Vec::new();
-                    if !abi3_interps.is_empty() {
-                        built_wheels.extend(self.build_pyo3_wheel_abi3(
-                            &abi3_interps,
-                            *major,
-                            *minor,
-                            &sbom_data,
-                        )?);
-                    }
-                    if !non_abi3_interps.is_empty() {
-                        let interp_names: HashSet<_> = non_abi3_interps
-                            .iter()
-                            .map(|interp| interp.to_string())
-                            .collect();
-                        eprintln!(
-                            "⚠️ Warning: {} does not yet support abi3 so the build artifacts will be version-specific.",
-                            interp_names.iter().join(", ")
-                        );
-                        built_wheels.extend(self.build_pyo3_wheels(&non_abi3_interps, &sbom_data)?);
-                    }
-                    built_wheels
+                    self.build_abi3_wheels(Some((*major, *minor)), &sbom_data)?
                 }
-                Some(Abi3Version::CurrentPython) => {
-                    let abi3_interps: Vec<_> = self
-                        .interpreter
-                        .iter()
-                        .filter(|interp| interp.has_stable_api())
-                        .cloned()
-                        .collect();
-                    let non_abi3_interps: Vec<_> = self
-                        .interpreter
-                        .iter()
-                        .filter(|interp| !interp.has_stable_api())
-                        .cloned()
-                        .collect();
-                    let mut built_wheels = Vec::new();
-                    if !abi3_interps.is_empty() {
-                        let interp = abi3_interps.first().unwrap();
-                        built_wheels.extend(self.build_pyo3_wheel_abi3(
-                            &abi3_interps,
-                            interp.major as u8,
-                            interp.minor as u8,
-                            &sbom_data,
-                        )?);
-                    }
-                    if !non_abi3_interps.is_empty() {
-                        let interp_names: HashSet<_> = non_abi3_interps
-                            .iter()
-                            .map(|interp| interp.to_string())
-                            .collect();
-                        eprintln!(
-                            "⚠️ Warning: {} does not yet support abi3 so the build artifacts will be version-specific.",
-                            interp_names.iter().join(", ")
-                        );
-                        built_wheels.extend(self.build_pyo3_wheels(&non_abi3_interps, &sbom_data)?);
-                    }
-                    built_wheels
-                }
+                Some(Abi3Version::CurrentPython) => self.build_abi3_wheels(None, &sbom_data)?,
                 None => self.build_pyo3_wheels(&self.interpreter, &sbom_data)?,
             },
             BridgeModel::Cffi => self.build_cffi_wheel(&sbom_data)?,
@@ -283,6 +150,68 @@ impl BuildContext {
         }
 
         Ok(wheels)
+    }
+
+    /// Split interpreters into abi3-capable and non-abi3 groups, build the
+    /// appropriate wheel type for each group, and return all built wheels.
+    ///
+    /// When `min_version` is `Some((major, minor))` (i.e. `Abi3Version::Version`),
+    /// interpreters below that version are excluded from the abi3 group.
+    /// When `min_version` is `None` (i.e. `Abi3Version::CurrentPython`),
+    /// all `has_stable_api()` interpreters are in the abi3 group and the
+    /// baseline version is taken from the first one.
+    fn build_abi3_wheels(
+        &self,
+        min_version: Option<(u8, u8)>,
+        sbom_data: &Option<SbomData>,
+    ) -> Result<Vec<BuiltWheelMetadata>> {
+        use itertools::Itertools;
+
+        let abi3_interps: Vec<_> = self
+            .interpreter
+            .iter()
+            .filter(|interp| {
+                interp.has_stable_api()
+                    && min_version.is_none_or(|(major, minor)| {
+                        (interp.major as u8, interp.minor as u8) >= (major, minor)
+                    })
+            })
+            .cloned()
+            .collect();
+        let non_abi3_interps: Vec<_> = self
+            .interpreter
+            .iter()
+            .filter(|interp| {
+                !interp.has_stable_api()
+                    || min_version.is_some_and(|(major, minor)| {
+                        (interp.major as u8, interp.minor as u8) < (major, minor)
+                    })
+            })
+            .cloned()
+            .collect();
+
+        let mut built_wheels = Vec::new();
+        if let Some(first) = abi3_interps.first() {
+            let (major, minor) = min_version.unwrap_or((first.major as u8, first.minor as u8));
+            built_wheels.extend(self.build_pyo3_wheel_abi3(
+                &abi3_interps,
+                major,
+                minor,
+                sbom_data,
+            )?);
+        }
+        if !non_abi3_interps.is_empty() {
+            let interp_names: HashSet<_> = non_abi3_interps
+                .iter()
+                .map(|interp| interp.to_string())
+                .collect();
+            eprintln!(
+                "⚠️ Warning: {} does not yet support abi3 so the build artifacts will be version-specific.",
+                interp_names.iter().join(", ")
+            );
+            built_wheels.extend(self.build_pyo3_wheels(&non_abi3_interps, sbom_data)?);
+        }
+        Ok(built_wheels)
     }
 
     /// Bridge model
@@ -329,7 +258,7 @@ impl BuildContext {
                 }
             },
             BridgeModel::Bin(None) | BridgeModel::Cffi | BridgeModel::UniFfi => {
-                self.get_universal_tags(&[PlatformTag::Linux])?.1
+                vec![self.get_universal_tag(&[PlatformTag::Linux])?]
             }
         };
         Ok(tags)
@@ -656,211 +585,71 @@ impl BuildContext {
 
     /// Returns the platform part of the tag for the wheel name
     pub fn get_platform_tag(&self, platform_tags: &[PlatformTag]) -> Result<String> {
-        if let Ok(host_platform) = env::var("_PYTHON_HOST_PLATFORM") {
-            let override_platform = host_platform.replace(['.', '-'], "_");
-            eprintln!(
-                "🚉 Overriding platform tag from _PYTHON_HOST_PLATFORM environment variable as {override_platform}."
-            );
-            return Ok(override_platform);
+        crate::target::get_platform_tag(
+            &self.target,
+            platform_tags,
+            self.universal2,
+            self.pyproject_toml.as_ref(),
+            &self.manifest_path,
+        )
+    }
+
+    /// Returns the platform tag without python version (e.g. `py3-none-manylinux_2_17_x86_64`)
+    pub fn get_universal_tag(&self, platform_tags: &[PlatformTag]) -> Result<String> {
+        let platform = self.get_platform_tag(platform_tags)?;
+        Ok(format!("py3-none-{platform}"))
+    }
+
+    /// Returns user-specified platform tags, or falls back to the auditwheel
+    /// policy tag when no explicit tags were provided.
+    fn resolve_platform_tags(&self, policy: &Policy) -> Vec<PlatformTag> {
+        if self.platform_tag.is_empty() {
+            vec![policy.platform_tag()]
+        } else {
+            self.platform_tag.clone()
         }
-
-        let target = &self.target;
-        let tag = match (&target.target_os(), &target.target_arch()) {
-            // Windows
-            (Os::Windows, Arch::X86) => "win32".to_string(),
-            (Os::Windows, Arch::X86_64) => "win_amd64".to_string(),
-            (Os::Windows, Arch::Aarch64) => "win_arm64".to_string(),
-            // Android
-            (Os::Android, _) => {
-                let arch = target.get_platform_arch()?;
-                let android_arch = match arch.as_str() {
-                    "armv7l" => "armeabi_v7a",
-                    "aarch64" => "arm64_v8a",
-                    "i686" => "x86",
-                    "x86_64" => "x86_64",
-                    _ => bail!("Unsupported Android architecture: {}", arch),
-                };
-                let api_level = find_android_api_level(target.target_triple(), &self.manifest_path)?;
-                format!("android_{}_{}", api_level, android_arch)
-            }
-            // Linux
-            (Os::Linux, _) => {
-                let arch = target.get_platform_arch()?;
-                let mut platform_tags = platform_tags.to_vec();
-                platform_tags.sort();
-                let mut tags = vec![];
-                for platform_tag in platform_tags {
-                    tags.push(format!("{platform_tag}_{arch}"));
-                    for alias in platform_tag.aliases() {
-                        tags.push(format!("{alias}_{arch}"));
-                    }
-                }
-                tags.join(".")
-            }
-            // macOS
-            (Os::Macos, Arch::X86_64) | (Os::Macos, Arch::Aarch64) => {
-                let ((x86_64_major, x86_64_minor), (arm64_major, arm64_minor)) = macosx_deployment_target(env::var("MACOSX_DEPLOYMENT_TARGET").ok().as_deref(), self.universal2)?;
-                let x86_64_tag = if let Some(deployment_target) = self.pyproject_toml.as_ref().and_then(|x| x.target_config("x86_64-apple-darwin")).and_then(|config| config.macos_deployment_target.as_ref()) {
-                    deployment_target.replace('.', "_")
-                } else {
-                    format!("{x86_64_major}_{x86_64_minor}")
-                };
-                let arm64_tag = if let Some(deployment_target) = self.pyproject_toml.as_ref().and_then(|x| x.target_config("aarch64-apple-darwin")).and_then(|config| config.macos_deployment_target.as_ref()) {
-                    deployment_target.replace('.', "_")
-                } else {
-                    format!("{arm64_major}_{arm64_minor}")
-                };
-                if self.universal2 {
-                    format!(
-                        "macosx_{x86_64_tag}_x86_64.macosx_{arm64_tag}_arm64.macosx_{x86_64_tag}_universal2"
-                    )
-                } else if target.target_arch() == Arch::Aarch64 {
-                    format!("macosx_{arm64_tag}_arm64")
-                } else {
-                    format!("macosx_{x86_64_tag}_x86_64")
-                }
-            }
-            // iOS (simulator and device)
-            (Os::Ios, Arch::X86_64) | (Os::Ios, Arch::Aarch64) => {
-                let arch = if target.target_arch() == Arch::Aarch64 {
-                    "arm64"
-                } else {
-                    "x86_64"
-                };
-                let abi = if target.target_arch() == Arch::X86_64 || self.target.target_triple().ends_with("-sim") {
-                    "iphonesimulator"
-                } else {
-                    "iphoneos"
-                };
-                let (min_sdk_major, min_sdk_minor) = iphoneos_deployment_target(env::var("IPHONEOS_DEPLOYMENT_TARGET").ok().as_deref())?;
-                format!("ios_{min_sdk_major}_{min_sdk_minor}_{arch}_{abi}")
-            }
-            // FreeBSD
-            | (Os::FreeBsd, _) => {
-                format!(
-                    "{}_{}_{}",
-                    target.target_os().to_string().to_ascii_lowercase(),
-                    target.get_platform_release()?.to_ascii_lowercase(),
-                    target.target_arch().machine(),
-                )
-            }
-            // NetBSD
-            | (Os::NetBsd, _)
-            // OpenBSD
-            | (Os::OpenBsd, _) => {
-                let release = target.get_platform_release()?;
-                format!(
-                    "{}_{}_{}",
-                    target.target_os().to_string().to_ascii_lowercase(),
-                    release,
-                    target.target_arch().machine(),
-                )
-            }
-            // DragonFly
-            (Os::Dragonfly, Arch::X86_64)
-            // Haiku
-            | (Os::Haiku, Arch::X86_64) => {
-                let release = target.get_platform_release()?;
-                format!(
-                    "{}_{}_{}",
-                    target.target_os().to_string().to_ascii_lowercase(),
-                    release.to_ascii_lowercase(),
-                    "x86_64"
-                )
-            }
-            // Emscripten
-            (Os::Emscripten, Arch::Wasm32) => {
-                let release = emscripten_version()?.replace(['.', '-'], "_");
-                format!("emscripten_{release}_wasm32")
-            }
-            (Os::Wasi, Arch::Wasm32) => {
-                "any".to_string()
-            }
-            // Cygwin
-            (Os::Cygwin, _) => {
-                format!(
-                    "{}_{}",
-                    target.target_os().to_string().to_ascii_lowercase(),
-                    target.get_platform_arch()?,
-                )
-            }
-            // osname_release_machine fallback for any POSIX system
-            (_, _) => {
-                let info = PlatformInfo::new()
-                    .map_err(|e| anyhow!("Failed to fetch platform information: {e}"))?;
-                let mut release = info.release().to_string_lossy().replace(['.', '-'], "_");
-                let mut machine = info.machine().to_string_lossy().replace([' ', '/'], "_");
-
-                let mut os = target.target_os().to_string().to_ascii_lowercase();
-                // See https://github.com/python/cpython/blob/46c8d915715aa2bd4d697482aa051fe974d440e1/Lib/sysconfig.py#L722-L730
-                if target.target_os() == Os::Solaris || target.target_os() == Os::Illumos {
-                    // Solaris / Illumos
-                    if let Some((major, other)) = release.split_once('_') {
-                        let major_ver: u64 = major.parse().context("illumos major version is not a number")?;
-                        if major_ver >= 5 {
-                            // SunOS 5 == Solaris 2
-                            os = "solaris".to_string();
-                            release = format!("{}_{}", major_ver - 3, other);
-                            machine = format!("{machine}_64bit");
-                        }
-                    }
-                }
-                format!(
-                    "{os}_{release}_{machine}"
-                )
-            }
-        };
-        Ok(tag)
     }
 
-    /// Returns the tags for the WHEEL file for cffi wheels
-    pub fn get_py3_tags(&self, platform_tags: &[PlatformTag]) -> Result<Vec<String>> {
-        let tags = vec![format!(
-            "py3-none-{}",
-            self.get_platform_tag(platform_tags)?
-        )];
-        Ok(tags)
-    }
-
-    /// Returns the tags for the platform without python version
-    pub fn get_universal_tags(
-        &self,
-        platform_tags: &[PlatformTag],
-    ) -> Result<(String, Vec<String>)> {
-        let tag = format!(
-            "py3-none-{platform}",
-            platform = self.get_platform_tag(platform_tags)?
-        );
-        let tags = self.get_py3_tags(platform_tags)?;
-        Ok((tag, tags))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn write_pyo3_wheel_abi3(
-        &self,
-        artifact: BuildArtifact,
-        platform_tags: &[PlatformTag],
-        ext_libs: Vec<Library>,
-        major: u8,
-        min_minor: u8,
+    /// Unified wheel-building pipeline for non-bin binding types.
+    ///
+    /// This method handles the common 8-step pattern shared by all extension
+    /// module wheels (PyO3, PyO3 abi3, CFFI, UniFfi):
+    ///   1. Create WheelWriter with compression options
+    ///   2. Create VirtualWriter with excludes
+    ///   3. Add external shared libraries (auditwheel repair)
+    ///   4. Run the binding generator (install extension + python files)
+    ///   5. Write .pth file for editable installs
+    ///   6. Add data directory
+    ///   7. Write SBOM files
+    ///   8. Finish the wheel
+    ///
+    /// The `make_generator` closure receives the writer's temp directory
+    /// (needed by some generators for intermediate files) and returns the
+    /// binding generator to use.
+    #[allow(clippy::too_many_arguments, clippy::needless_lifetimes)]
+    fn write_wheel<'a, F>(
+        &'a self,
+        tag: &str,
+        artifacts: &[&BuildArtifact],
+        ext_libs: &[Vec<Library>],
+        make_generator: F,
         sbom_data: &Option<SbomData>,
         out_dirs: &HashMap<String, PathBuf>,
-    ) -> Result<BuiltWheelMetadata> {
-        let platform = self.get_platform_tag(platform_tags)?;
-        let tag = format!("cp{major}{min_minor}-abi3-{platform}");
-
+    ) -> Result<PathBuf>
+    where
+        F: FnOnce(Rc<tempfile::TempDir>) -> Result<Box<dyn BindingGenerator + 'a>>,
+    {
         let file_options = self
             .compression
             .get_file_options()
             .last_modified_time(zip_mtime());
-        let writer = WheelWriter::new(&tag, &self.out, &self.metadata24, file_options)?;
+        let writer = WheelWriter::new(tag, &self.out, &self.metadata24, file_options)?;
         let mut writer = VirtualWriter::new(writer, self.excludes(Format::Wheel)?);
-        self.add_external_libs(&mut writer, &[&artifact], &[ext_libs])?;
+        self.add_external_libs(&mut writer, artifacts, ext_libs)?;
 
-        let mut generator =
-            Pyo3BindingGenerator::new(true, self.interpreter.first(), writer.temp_dir()?)
-                .context("Failed to initialize PyO3 binding generator")?;
-        generate_binding(&mut writer, &mut generator, self, &[&artifact], out_dirs)
+        let temp_dir = writer.temp_dir()?;
+        let mut generator = make_generator(temp_dir)?;
+        generate_binding(&mut writer, generator.as_mut(), self, artifacts, out_dirs)
             .context("Failed to add the files to the wheel")?;
 
         self.add_pth(&mut writer)?;
@@ -877,12 +666,10 @@ impl BuildContext {
             &self.metadata24.get_dist_info_dir(),
         )?;
 
-        let wheel_path = writer.finish(
-            &self.metadata24,
-            &self.project_layout.project_root,
-            std::slice::from_ref(&tag),
-        )?;
-        Ok((wheel_path, format!("cp{major}{min_minor}")))
+        let tags = [tag.to_string()];
+        let wheel_path =
+            writer.finish(&self.metadata24, &self.project_layout.project_root, &tags)?;
+        Ok(wheel_path)
     }
 
     /// For abi3 we only need to build a single wheel and we don't even need a python interpreter
@@ -904,17 +691,21 @@ impl BuildContext {
         )?;
         let (policy, external_libs) =
             self.auditwheel(&artifact, &self.platform_tag, python_interpreter)?;
-        let platform_tags = if self.platform_tag.is_empty() {
-            vec![policy.platform_tag()]
-        } else {
-            self.platform_tag.clone()
-        };
-        let (wheel_path, tag) = self.write_pyo3_wheel_abi3(
-            artifact,
-            &platform_tags,
-            external_libs,
-            major,
-            min_minor,
+        let platform_tags = self.resolve_platform_tags(&policy);
+
+        let platform = self.get_platform_tag(&platform_tags)?;
+        let tag = format!("cp{major}{min_minor}-abi3-{platform}");
+
+        let wheel_path = self.write_wheel(
+            &tag,
+            &[&artifact],
+            &[external_libs],
+            |temp_dir| {
+                Ok(Box::new(
+                    Pyo3BindingGenerator::new(true, self.interpreter.first(), temp_dir)
+                        .context("Failed to initialize PyO3 binding generator")?,
+                ))
+            },
             sbom_data,
             &out_dirs,
         )?;
@@ -925,7 +716,7 @@ impl BuildContext {
             min_minor,
             wheel_path.display()
         );
-        wheels.push((wheel_path, tag));
+        wheels.push((wheel_path, format!("cp{major}{min_minor}")));
 
         Ok(wheels)
     }
@@ -938,46 +729,22 @@ impl BuildContext {
         ext_libs: Vec<Library>,
         sbom_data: &Option<SbomData>,
         out_dirs: &HashMap<String, PathBuf>,
-    ) -> Result<BuiltWheelMetadata> {
+    ) -> Result<PathBuf> {
         let tag = python_interpreter.get_tag(self, platform_tags)?;
 
-        let file_options = self
-            .compression
-            .get_file_options()
-            .last_modified_time(zip_mtime());
-        let writer = WheelWriter::new(&tag, &self.out, &self.metadata24, file_options)?;
-        let mut writer = VirtualWriter::new(writer, self.excludes(Format::Wheel)?);
-        self.add_external_libs(&mut writer, &[&artifact], &[ext_libs])?;
-
-        let mut generator =
-            Pyo3BindingGenerator::new(false, Some(python_interpreter), writer.temp_dir()?)
-                .context("Failed to initialize PyO3 binding generator")?;
-        generate_binding(&mut writer, &mut generator, self, &[&artifact], out_dirs)
-            .context("Failed to add the files to the wheel")?;
-
-        self.add_pth(&mut writer)?;
-        add_data(
-            &mut writer,
-            &self.metadata24,
-            self.project_layout.data.as_deref(),
-        )?;
-
-        write_sboms(
-            self,
-            sbom_data.as_ref(),
-            &mut writer,
-            &self.metadata24.get_dist_info_dir(),
-        )?;
-
-        let wheel_path = writer.finish(
-            &self.metadata24,
-            &self.project_layout.project_root,
-            std::slice::from_ref(&tag),
-        )?;
-        Ok((
-            wheel_path,
-            format!("cp{}{}", python_interpreter.major, python_interpreter.minor),
-        ))
+        self.write_wheel(
+            &tag,
+            &[&artifact],
+            &[ext_libs],
+            |temp_dir| {
+                Ok(Box::new(
+                    Pyo3BindingGenerator::new(false, Some(python_interpreter), temp_dir)
+                        .context("Failed to initialize PyO3 binding generator")?,
+                ))
+            },
+            sbom_data,
+            out_dirs,
+        )
     }
 
     /// Builds wheels for a pyo3 extension for all given python versions.
@@ -1000,12 +767,8 @@ impl BuildContext {
             )?;
             let (policy, external_libs) =
                 self.auditwheel(&artifact, &self.platform_tag, Some(python_interpreter))?;
-            let platform_tags = if self.platform_tag.is_empty() {
-                vec![policy.platform_tag()]
-            } else {
-                self.platform_tag.clone()
-            };
-            let (wheel_path, tag) = self.write_pyo3_wheel(
+            let platform_tags = self.resolve_platform_tags(&policy);
+            let wheel_path = self.write_pyo3_wheel(
                 python_interpreter,
                 artifact,
                 &platform_tags,
@@ -1022,6 +785,7 @@ impl BuildContext {
                 wheel_path.display()
             );
 
+            let tag = format!("cp{}{}", python_interpreter.major, python_interpreter.minor);
             wheels.push((wheel_path, tag));
         }
 
@@ -1090,41 +854,25 @@ impl BuildContext {
         ext_libs: Vec<Library>,
         sbom_data: &Option<SbomData>,
         out_dirs: &HashMap<String, PathBuf>,
-    ) -> Result<BuiltWheelMetadata> {
-        let (tag, tags) = self.get_universal_tags(platform_tags)?;
-
-        let file_options = self
-            .compression
-            .get_file_options()
-            .last_modified_time(zip_mtime());
-        let writer = WheelWriter::new(&tag, &self.out, &self.metadata24, file_options)?;
-        let mut writer = VirtualWriter::new(writer, self.excludes(Format::Wheel)?);
-        self.add_external_libs(&mut writer, &[&artifact], &[ext_libs])?;
+    ) -> Result<PathBuf> {
+        let tag = self.get_universal_tag(platform_tags)?;
 
         let interpreter = self.interpreter.first().ok_or_else(|| {
             anyhow!("A python interpreter is required for cffi builds but one was not provided")
         })?;
-        let mut generator = CffiBindingGenerator::new(interpreter, writer.temp_dir()?)
-            .context("Failed to initialize Cffi binding generator")?;
-        generate_binding(&mut writer, &mut generator, self, &[&artifact], out_dirs)?;
-
-        self.add_pth(&mut writer)?;
-        add_data(
-            &mut writer,
-            &self.metadata24,
-            self.project_layout.data.as_deref(),
-        )?;
-
-        write_sboms(
-            self,
-            sbom_data.as_ref(),
-            &mut writer,
-            &self.metadata24.get_dist_info_dir(),
-        )?;
-
-        let wheel_path =
-            writer.finish(&self.metadata24, &self.project_layout.project_root, &tags)?;
-        Ok((wheel_path, "py3".to_string()))
+        self.write_wheel(
+            &tag,
+            &[&artifact],
+            &[ext_libs],
+            |temp_dir| {
+                Ok(Box::new(
+                    CffiBindingGenerator::new(interpreter, temp_dir)
+                        .context("Failed to initialize Cffi binding generator")?,
+                ))
+            },
+            sbom_data,
+            out_dirs,
+        )
     }
 
     /// Builds a wheel with cffi bindings
@@ -1135,12 +883,8 @@ impl BuildContext {
         let mut wheels = Vec::new();
         let (artifact, out_dirs) = self.compile_cdylib(None, None)?;
         let (policy, external_libs) = self.auditwheel(&artifact, &self.platform_tag, None)?;
-        let platform_tags = if self.platform_tag.is_empty() {
-            vec![policy.platform_tag()]
-        } else {
-            self.platform_tag.clone()
-        };
-        let (wheel_path, tag) = self.write_cffi_wheel(
+        let platform_tags = self.resolve_platform_tags(&policy);
+        let wheel_path = self.write_cffi_wheel(
             artifact,
             &platform_tags,
             external_libs,
@@ -1162,7 +906,7 @@ impl BuildContext {
         }
 
         eprintln!("📦 Built wheel to {}", wheel_path.display());
-        wheels.push((wheel_path, tag));
+        wheels.push((wheel_path, "py3".to_string()));
 
         Ok(wheels)
     }
@@ -1174,37 +918,17 @@ impl BuildContext {
         ext_libs: Vec<Library>,
         sbom_data: &Option<SbomData>,
         out_dirs: &HashMap<String, PathBuf>,
-    ) -> Result<BuiltWheelMetadata> {
-        let (tag, tags) = self.get_universal_tags(platform_tags)?;
+    ) -> Result<PathBuf> {
+        let tag = self.get_universal_tag(platform_tags)?;
 
-        let file_options = self
-            .compression
-            .get_file_options()
-            .last_modified_time(zip_mtime());
-        let writer = WheelWriter::new(&tag, &self.out, &self.metadata24, file_options)?;
-        let mut writer = VirtualWriter::new(writer, self.excludes(Format::Wheel)?);
-        self.add_external_libs(&mut writer, &[&artifact], &[ext_libs])?;
-
-        let mut generator = UniFfiBindingGenerator::default();
-        generate_binding(&mut writer, &mut generator, self, &[&artifact], out_dirs)?;
-
-        self.add_pth(&mut writer)?;
-        add_data(
-            &mut writer,
-            &self.metadata24,
-            self.project_layout.data.as_deref(),
-        )?;
-
-        write_sboms(
-            self,
-            sbom_data.as_ref(),
-            &mut writer,
-            &self.metadata24.get_dist_info_dir(),
-        )?;
-
-        let wheel_path =
-            writer.finish(&self.metadata24, &self.project_layout.project_root, &tags)?;
-        Ok((wheel_path, "py3".to_string()))
+        self.write_wheel(
+            &tag,
+            &[&artifact],
+            &[ext_libs],
+            |_temp_dir| Ok(Box::new(UniFfiBindingGenerator::default())),
+            sbom_data,
+            out_dirs,
+        )
     }
 
     /// Builds a wheel with uniffi bindings
@@ -1215,12 +939,8 @@ impl BuildContext {
         let mut wheels = Vec::new();
         let (artifact, out_dirs) = self.compile_cdylib(None, None)?;
         let (policy, external_libs) = self.auditwheel(&artifact, &self.platform_tag, None)?;
-        let platform_tags = if self.platform_tag.is_empty() {
-            vec![policy.platform_tag()]
-        } else {
-            self.platform_tag.clone()
-        };
-        let (wheel_path, tag) = self.write_uniffi_wheel(
+        let platform_tags = self.resolve_platform_tags(&policy);
+        let wheel_path = self.write_uniffi_wheel(
             artifact,
             &platform_tags,
             external_libs,
@@ -1229,7 +949,7 @@ impl BuildContext {
         )?;
 
         eprintln!("📦 Built wheel to {}", wheel_path.display());
-        wheels.push((wheel_path, tag));
+        wheels.push((wheel_path, "py3".to_string()));
 
         Ok(wheels)
     }
@@ -1242,7 +962,7 @@ impl BuildContext {
         ext_libs: &[Vec<Library>],
         sbom_data: &Option<SbomData>,
         out_dirs: &HashMap<String, PathBuf>,
-    ) -> Result<BuiltWheelMetadata> {
+    ) -> Result<PathBuf> {
         if !self.metadata24.scripts.is_empty() {
             bail!("Defining scripts and working with a binary doesn't mix well");
         }
@@ -1260,11 +980,10 @@ impl BuildContext {
             }
         }
 
-        let (tag, tags) = match (self.bridge(), python_interpreter) {
-            (BridgeModel::Bin(None), _) => self.get_universal_tags(platform_tags)?,
+        let tag = match (self.bridge(), python_interpreter) {
+            (BridgeModel::Bin(None), _) => self.get_universal_tag(platform_tags)?,
             (BridgeModel::Bin(Some(..)), Some(python_interpreter)) => {
-                let tag = python_interpreter.get_tag(self, platform_tags)?;
-                (tag.clone(), vec![tag])
+                python_interpreter.get_tag(self, platform_tags)?
             }
             _ => unreachable!(),
         };
@@ -1295,8 +1014,9 @@ impl BuildContext {
             &mut writer,
             &metadata24.get_dist_info_dir(),
         )?;
+        let tags = [tag];
         let wheel_path = writer.finish(&metadata24, &self.project_layout.project_root, &tags)?;
-        Ok((wheel_path, "py3".to_string()))
+        Ok(wheel_path)
     }
 
     /// Builds a wheel that contains a binary
@@ -1331,13 +1051,9 @@ impl BuildContext {
             artifact_paths.push(artifact);
         }
         let policy = policies.iter().min_by_key(|p| p.priority).unwrap();
-        let platform_tags = if self.platform_tag.is_empty() {
-            vec![policy.platform_tag()]
-        } else {
-            self.platform_tag.clone()
-        };
+        let platform_tags = self.resolve_platform_tags(policy);
 
-        let (wheel_path, tag) = self.write_bin_wheel(
+        let wheel_path = self.write_bin_wheel(
             python_interpreter,
             &artifact_paths,
             &platform_tags,
@@ -1346,7 +1062,7 @@ impl BuildContext {
             &result.out_dirs,
         )?;
         eprintln!("📦 Built wheel to {}", wheel_path.display());
-        wheels.push((wheel_path, tag));
+        wheels.push((wheel_path, "py3".to_string()));
 
         Ok(wheels)
     }
@@ -1364,282 +1080,5 @@ impl BuildContext {
             wheels.extend(self.build_bin_wheel(Some(python_interpreter), sbom_data)?);
         }
         Ok(wheels)
-    }
-}
-
-/// Calculate the sha256 of a file
-pub fn hash_file(path: impl AsRef<Path>) -> Result<String, io::Error> {
-    let mut file = fs::File::open(path.as_ref())?;
-    let mut hasher = Sha256::new();
-    io::copy(&mut file, &mut hasher)?;
-    let hex = format!("{:x}", hasher.finalize());
-    Ok(hex)
-}
-
-/// Get the default macOS deployment target version
-fn macosx_deployment_target(
-    deploy_target: Option<&str>,
-    universal2: bool,
-) -> Result<((u16, u16), (u16, u16))> {
-    let x86_64_default_rustc = rustc_macosx_target_version("x86_64-apple-darwin");
-    let x86_64_default = if universal2 && x86_64_default_rustc.1 < 9 {
-        (10, 9)
-    } else {
-        x86_64_default_rustc
-    };
-    let arm64_default = rustc_macosx_target_version("aarch64-apple-darwin");
-    let mut x86_64_ver = x86_64_default;
-    let mut arm64_ver = arm64_default;
-    if let Some(deploy_target) = deploy_target {
-        let err_ctx = "MACOSX_DEPLOYMENT_TARGET is invalid";
-        let mut parts = deploy_target.split('.');
-        let major = parts.next().context(err_ctx)?;
-        let major: u16 = major.parse().context(err_ctx)?;
-        let minor = parts.next().context(err_ctx)?;
-        let minor: u16 = minor.parse().context(err_ctx)?;
-        if (major, minor) > x86_64_default {
-            x86_64_ver = (major, minor);
-        }
-        if (major, minor) > arm64_default {
-            arm64_ver = (major, minor);
-        }
-    }
-    Ok((
-        python_macosx_target_version(x86_64_ver),
-        python_macosx_target_version(arm64_ver),
-    ))
-}
-
-/// Get the iOS deployment target version
-fn iphoneos_deployment_target(deploy_target: Option<&str>) -> Result<(u16, u16)> {
-    let (major, minor) = if let Some(deploy_target) = deploy_target {
-        let err_ctx = "IPHONEOS_DEPLOYMENT_TARGET is invalid";
-        let mut parts = deploy_target.split('.');
-        let major = parts.next().context(err_ctx)?;
-        let major: u16 = major.parse().context(err_ctx)?;
-        let minor = parts.next().context(err_ctx)?;
-        let minor: u16 = minor.parse().context(err_ctx)?;
-        (major, minor)
-    } else {
-        (13, 0)
-    };
-
-    Ok((major, minor))
-}
-
-#[inline]
-fn python_macosx_target_version(version: (u16, u16)) -> (u16, u16) {
-    let (major, minor) = version;
-    if major >= 11 {
-        // pip only supports (major, 0) for macOS 11+
-        (major, 0)
-    } else {
-        (major, minor)
-    }
-}
-
-pub(crate) fn rustc_macosx_target_version(target: &str) -> (u16, u16) {
-    use std::process::{Command, Stdio};
-    use target_lexicon::OperatingSystem;
-
-    // On rustc 1.71.0+ we can use `rustc --print deployment-target`
-    if let Ok(output) = Command::new("rustc")
-        .stderr(Stdio::piped())
-        .stdout(Stdio::piped())
-        .env_remove("MACOSX_DEPLOYMENT_TARGET")
-        .args(["--target", target])
-        .args(["--print", "deployment-target"])
-        .output()
-        && output.status.success()
-    {
-        let target_version = std::str::from_utf8(&output.stdout)
-            .unwrap()
-            .split('=')
-            .next_back()
-            .and_then(|v| v.trim().split_once('.'));
-        if let Some((major, minor)) = target_version {
-            let major: u16 = major.parse().unwrap();
-            let minor: u16 = minor.parse().unwrap();
-            return (major, minor);
-        }
-    }
-
-    let fallback_version = if target == "aarch64-apple-darwin" {
-        (11, 0)
-    } else {
-        (10, 7)
-    };
-
-    let rustc_target_version = || -> Result<(u16, u16)> {
-        let cmd = Command::new("rustc")
-            .arg("-Z")
-            .arg("unstable-options")
-            .arg("--print")
-            .arg("target-spec-json")
-            .arg("--target")
-            .arg(target)
-            .env("RUSTC_BOOTSTRAP", "1")
-            .env_remove("MACOSX_DEPLOYMENT_TARGET")
-            .output()
-            .context("Failed to run rustc to get the target spec")?;
-        let stdout = String::from_utf8(cmd.stdout).context("rustc output is not valid utf-8")?;
-        let spec: serde_json::Value =
-            serde_json::from_str(&stdout).context("rustc output is not valid json")?;
-        let llvm_target = spec
-            .as_object()
-            .context("rustc output is not a json object")?
-            .get("llvm-target")
-            .context("rustc output does not contain llvm-target")?
-            .as_str()
-            .context("llvm-target is not a string")?;
-        let triple = llvm_target.parse::<target_lexicon::Triple>();
-        let (major, minor) = match triple.map(|t| t.operating_system) {
-            Ok(
-                OperatingSystem::MacOSX(Some(deployment_target))
-                | OperatingSystem::Darwin(Some(deployment_target)),
-            ) => (deployment_target.major, u16::from(deployment_target.minor)),
-            _ => fallback_version,
-        };
-        Ok((major, minor))
-    };
-    rustc_target_version().unwrap_or(fallback_version)
-}
-
-/// Emscripten version
-fn emscripten_version() -> Result<String> {
-    let os_version = env::var("MATURIN_EMSCRIPTEN_VERSION");
-    let release = match os_version {
-        Ok(os_ver) => os_ver,
-        Err(_) => emcc_version()?,
-    };
-    Ok(release)
-}
-
-fn emcc_version() -> Result<String> {
-    use std::process::Command;
-
-    let emcc = Command::new(if cfg!(windows) { "emcc.bat" } else { "emcc" })
-        .arg("-dumpversion")
-        .output()
-        .context("Failed to run emcc to get the version")?;
-    let ver = String::from_utf8(emcc.stdout)?;
-    let mut trimmed = ver.trim();
-    trimmed = trimmed.strip_suffix("-git").unwrap_or(trimmed);
-    Ok(trimmed.into())
-}
-
-fn find_android_api_level(target_triple: &str, manifest_path: &Path) -> Result<String> {
-    if let Ok(val) = env::var("ANDROID_API_LEVEL") {
-        return Ok(val);
-    }
-
-    let mut clues = Vec::new();
-
-    // 1. Linker from cargo-config2
-    if let Some(manifest_dir) = manifest_path.parent()
-        && let Ok(config) = cargo_config2::Config::load_with_cwd(manifest_dir)
-        && let Ok(Some(linker)) = config.linker(target_triple)
-    {
-        clues.push(linker.to_string_lossy().into_owned());
-    }
-
-    // 2. CC env vars
-    if let Ok(cc) = env::var(format!("CC_{}", target_triple.replace('-', "_"))) {
-        clues.push(cc);
-    }
-    if let Ok(cc) = env::var("CC") {
-        clues.push(cc);
-    }
-
-    // Search for android(\d+) in clues
-    let re = Regex::new(r"android(\d+)")?;
-    for clue in clues {
-        if let Some(caps) = re.captures(&clue) {
-            return Ok(caps[1].to_string());
-        }
-    }
-
-    bail!(
-        "Failed to determine Android API level. Please set the ANDROID_API_LEVEL environment variable."
-    );
-}
-
-/// Returns a DateTime representing the value SOURCE_DATE_EPOCH environment variable
-/// Note that the earliest timestamp a zip file can represent is 1980-01-01
-fn zip_mtime() -> DateTime {
-    let res = env::var("SOURCE_DATE_EPOCH")
-        .context("") // Only using context() to unify the error types
-        .and_then(|epoch| {
-            let epoch: i64 = epoch.parse()?;
-            let dt = time::OffsetDateTime::from_unix_timestamp(epoch)?;
-            let dt = time::PrimitiveDateTime::new(dt.date(), dt.time());
-            let dt = DateTime::try_from(dt)?;
-            Ok(dt)
-        });
-
-    res.unwrap_or_default()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{iphoneos_deployment_target, macosx_deployment_target};
-    use pretty_assertions::assert_eq;
-
-    #[test]
-    fn test_macosx_deployment_target() {
-        let rustc_ver = rustc_version::version().unwrap();
-        let rustc_ver = (rustc_ver.major, rustc_ver.minor);
-        let x86_64_minor = if rustc_ver >= (1, 74) { 12 } else { 7 };
-        let universal2_minor = if rustc_ver >= (1, 74) { 12 } else { 9 };
-        assert_eq!(
-            macosx_deployment_target(None, false).unwrap(),
-            ((10, x86_64_minor), (11, 0))
-        );
-        assert_eq!(
-            macosx_deployment_target(None, true).unwrap(),
-            ((10, universal2_minor), (11, 0))
-        );
-        assert_eq!(
-            macosx_deployment_target(Some("10.6"), false).unwrap(),
-            ((10, x86_64_minor), (11, 0))
-        );
-        assert_eq!(
-            macosx_deployment_target(Some("10.6"), true).unwrap(),
-            ((10, universal2_minor), (11, 0))
-        );
-        assert_eq!(
-            macosx_deployment_target(Some("10.9"), false).unwrap(),
-            ((10, universal2_minor), (11, 0))
-        );
-        assert_eq!(
-            macosx_deployment_target(Some("11.0.0"), false).unwrap(),
-            ((11, 0), (11, 0))
-        );
-        assert_eq!(
-            macosx_deployment_target(Some("11.1"), false).unwrap(),
-            ((11, 0), (11, 0))
-        );
-    }
-
-    #[test]
-    fn test_iphoneos_deployment_target() {
-        // Use default when no value is provided
-        assert_eq!(iphoneos_deployment_target(None).unwrap(), (13, 0));
-
-        // Valid version strings
-        assert_eq!(iphoneos_deployment_target(Some("13.0")).unwrap(), (13, 0));
-        assert_eq!(iphoneos_deployment_target(Some("14.5")).unwrap(), (14, 5));
-        assert_eq!(iphoneos_deployment_target(Some("15.0")).unwrap(), (15, 0));
-        // Extra parts are ignored
-        assert_eq!(iphoneos_deployment_target(Some("14.5.1")).unwrap(), (14, 5));
-
-        // Invalid formats
-        assert!(iphoneos_deployment_target(Some("invalid")).is_err());
-        assert!(iphoneos_deployment_target(Some("13")).is_err());
-        assert!(iphoneos_deployment_target(Some("13.")).is_err());
-        assert!(iphoneos_deployment_target(Some(".0")).is_err());
-        assert!(iphoneos_deployment_target(Some("abc.def")).is_err());
-        assert!(iphoneos_deployment_target(Some("13.abc")).is_err());
-        assert!(iphoneos_deployment_target(Some("")).is_err());
     }
 }
